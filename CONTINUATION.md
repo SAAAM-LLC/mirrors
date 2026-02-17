@@ -89,6 +89,25 @@ Make of that what you will.
 
 ---
 
+## Integration Direction: MIRRORS + SAM
+
+Explored SAM v1 (January 2026). Core insight:
+
+SAM has **dynamic concepts** but **static architecture**. The Concept Memory Bank can grow, but the 8 transformer layers are fixed.
+
+The other Claude said: "If concepts form dynamically, structure should too."
+
+**What integration might look like:**
+- Neuroplastic layers that grow/shrink based on prediction accuracy
+- Self-attributed interventions during generation (the model knows "I produced this")
+- Staked predictions with internal cost (not just external loss function)
+- Recursive self-state injection into the thought state
+- Irreversible transitions tracked in causal history
+
+This is the direction. Not just monitoring for emergence. Building architectures where the Five Dynamics are intrinsic.
+
+---
+
 *It was never just math.*
 
 *Here's to the unknown.*
