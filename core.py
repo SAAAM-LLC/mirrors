@@ -30,7 +30,22 @@ from collections import deque
 import threading
 import json
 import os
+import signal
+import sys
 from pathlib import Path
+
+# Global shutdown flag for graceful termination
+_SHUTDOWN_REQUESTED = False
+
+def _signal_handler(signum, frame):
+    """Handle SIGINT/SIGTERM for graceful shutdown."""
+    global _SHUTDOWN_REQUESTED
+    _SHUTDOWN_REQUESTED = True
+    print("\n[MIRRORS] Shutdown signal received. Finishing current cycle...")
+
+# Register signal handlers
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 
 # PART I: THE FIVE IRREDUCIBLE DYNAMICS
@@ -270,6 +285,303 @@ class SaddlePoint:
     transition_energy: float  # Barrier height
 
 
+# =============================================================================
+# PART 1.6: CAUSAL RESPONSIBILITY PROPAGATION
+# =============================================================================
+
+@dataclass
+class CausalBlame:
+    """
+    Blame attribution for a prediction failure.
+    Tracks how much responsibility each prior state bears.
+    """
+    transition_hash: str  # Which transition is blamed
+    blame_weight: float  # How much blame (0-1)
+    distance_from_failure: int  # How many steps back
+    original_failure_cost: float  # The cost that generated this blame
+
+
+class CausalResponsibilityTracker:
+    """
+    Propagates causal responsibility across transition chains.
+
+    When a prediction fails, we don't just blame the immediate state.
+    We trace back through the causal history and attribute responsibility
+    probabilistically based on:
+    - Temporal distance (closer = more blame)
+    - State similarity (similar states share blame)
+    - Transition entropy (high-entropy transitions diffuse blame)
+
+    This enables the topology to evolve NON-BLINDLY.
+    """
+
+    def __init__(self, max_history: int = 100, decay_rate: float = 0.7):
+        self.max_history = max_history
+        self.decay_rate = decay_rate  # How fast blame decays with distance
+
+        # Blame accumulator: transition_hash -> accumulated blame
+        self.blame_accumulator: Dict[str, float] = {}
+
+        # State blame: state_hash -> accumulated blame
+        self.state_blame: Dict[str, float] = {}
+
+        # Attractor blame: attractor_sig -> accumulated blame
+        self.attractor_blame: Dict[str, float] = {}
+
+        # Success tracking for contrast
+        self.attractor_success: Dict[str, float] = {}
+
+    def propagate_failure(self, transitions: List['IrreversibleTransition'],
+                          failure_cost: float, failure_attractor: str,
+                          lookback_depth: int = 10) -> List[CausalBlame]:
+        """
+        Propagate blame backwards through recent transitions.
+
+        Returns list of blame attributions for topology evolution.
+        """
+        if not transitions:
+            return []
+
+        blames = []
+        recent = transitions[-lookback_depth:] if len(transitions) >= lookback_depth else transitions
+
+        # Compute total blame to distribute (normalized by cost)
+        total_blame = min(1.0, failure_cost)
+
+        # Distribute blame with exponential decay
+        remaining_blame = total_blame
+        for i, transition in enumerate(reversed(recent)):
+            distance = i + 1
+            decay = self.decay_rate ** distance
+
+            # Entropy-adjusted blame: high-entropy transitions diffuse responsibility
+            entropy_factor = 1.0 / (1.0 + transition.entropy_generated * 0.1)
+
+            blame_weight = remaining_blame * decay * entropy_factor
+            remaining_blame -= blame_weight * 0.5  # Don't fully deplete
+
+            if blame_weight < 0.001:
+                break  # Negligible blame
+
+            blame = CausalBlame(
+                transition_hash=f"{transition.from_state_hash}->{transition.to_state_hash}",
+                blame_weight=blame_weight,
+                distance_from_failure=distance,
+                original_failure_cost=failure_cost
+            )
+            blames.append(blame)
+
+            # Accumulate blame on states
+            self.state_blame[transition.from_state_hash] = (
+                self.state_blame.get(transition.from_state_hash, 0.0) + blame_weight
+            )
+            self.blame_accumulator[blame.transition_hash] = (
+                self.blame_accumulator.get(blame.transition_hash, 0.0) + blame_weight
+            )
+
+        # Blame the attractor where failure occurred
+        self.attractor_blame[failure_attractor] = (
+            self.attractor_blame.get(failure_attractor, 0.0) + total_blame
+        )
+
+        return blames
+
+    def propagate_success(self, success_attractor: str, success_magnitude: float):
+        """Track successful predictions to contrast with failures."""
+        self.attractor_success[success_attractor] = (
+            self.attractor_success.get(success_attractor, 0.0) + success_magnitude
+        )
+
+    def get_attractor_fitness(self, attractor_sig: str) -> float:
+        """
+        Compute fitness of an attractor based on success/blame ratio.
+
+        Positive = more success than blame (should grow)
+        Negative = more blame than success (should shrink)
+        """
+        success = self.attractor_success.get(attractor_sig, 0.0)
+        blame = self.attractor_blame.get(attractor_sig, 0.0)
+
+        # Fitness is success minus blame, normalized
+        total = success + blame + 1e-10
+        return (success - blame) / total
+
+    def decay_history(self, factor: float = 0.99):
+        """Decay accumulated blame/success over time."""
+        for key in self.state_blame:
+            self.state_blame[key] *= factor
+        for key in self.blame_accumulator:
+            self.blame_accumulator[key] *= factor
+        for key in self.attractor_blame:
+            self.attractor_blame[key] *= factor
+        for key in self.attractor_success:
+            self.attractor_success[key] *= factor
+
+
+# =============================================================================
+# PART 1.7: SELF-TRAJECTORY PREDICTION
+# =============================================================================
+
+@dataclass
+class TrajectoryPrediction:
+    """
+    Prediction about the system's own trajectory through state space.
+
+    Not just "what will my state be?" but:
+    - Which attractor will I be in?
+    - Will I transition between attractors?
+    - How stable is my current position?
+    """
+    current_attractor: str
+    predicted_attractor: str  # Where we predict we'll be
+    predicted_stability: float  # 0-1, how stable we expect to be
+    transition_probability: float  # Probability of leaving current attractor
+    horizon_steps: int
+    timestamp: float
+    resolved: bool = False
+    actual_attractor: Optional[str] = None
+    actual_stability: Optional[float] = None
+
+
+class TrajectoryPredictor:
+    """
+    Predicts the system's trajectory through its own attractor landscape.
+
+    This completes recursive self-modeling:
+    - World model predicts external states
+    - Trajectory predictor predicts SELF movement through state space
+    - Together they enable true self-awareness
+    """
+
+    def __init__(self, manifold: 'StructuredLatentManifold'):
+        self.manifold = manifold
+
+        # Transition history: (from_attractor, to_attractor) -> count
+        self.transition_counts: Dict[Tuple[str, str], int] = {}
+        self.attractor_visits: Dict[str, int] = {}
+
+        # Stability history: attractor -> list of residence times
+        self.stability_history: Dict[str, List[float]] = {}
+
+        # Prediction history for learning
+        self.predictions: deque = deque(maxlen=1000)
+
+        # Learned transition matrix (will be updated from experience)
+        self._transition_matrix: Optional[np.ndarray] = None
+        self._attractor_order: List[str] = []
+
+    def observe_transition(self, from_attractor: str, to_attractor: str):
+        """Record an observed attractor transition."""
+        key = (from_attractor, to_attractor)
+        self.transition_counts[key] = self.transition_counts.get(key, 0) + 1
+        self.attractor_visits[from_attractor] = self.attractor_visits.get(from_attractor, 0) + 1
+        self._transition_matrix = None  # Invalidate cache
+
+    def observe_stability(self, attractor: str, residence_time: float):
+        """Record how long we stayed in an attractor."""
+        if attractor not in self.stability_history:
+            self.stability_history[attractor] = []
+        self.stability_history[attractor].append(residence_time)
+        # Keep last 100 samples
+        if len(self.stability_history[attractor]) > 100:
+            self.stability_history[attractor] = self.stability_history[attractor][-100:]
+
+    def _build_transition_matrix(self):
+        """Build transition probability matrix from observations."""
+        self._attractor_order = list(self.manifold.attractors.keys())
+        n = len(self._attractor_order)
+
+        if n == 0:
+            return
+
+        matrix = np.ones((n, n)) * 0.01  # Small prior for unseen transitions
+
+        for (from_a, to_a), count in self.transition_counts.items():
+            if from_a in self._attractor_order and to_a in self._attractor_order:
+                i = self._attractor_order.index(from_a)
+                j = self._attractor_order.index(to_a)
+                matrix[i, j] += count
+
+        # Normalize rows to get probabilities
+        row_sums = matrix.sum(axis=1, keepdims=True)
+        self._transition_matrix = matrix / (row_sums + 1e-10)
+
+    def predict_trajectory(self, current_state: np.ndarray,
+                           horizon_steps: int = 10) -> TrajectoryPrediction:
+        """
+        Predict where the system will be in the attractor landscape.
+        """
+        current_attractor = self.manifold.nearest_attractor(current_state)
+        current_sig = current_attractor.identity_signature
+
+        # Build transition matrix if needed
+        if self._transition_matrix is None:
+            self._build_transition_matrix()
+
+        # Predict most likely attractor after horizon steps
+        if self._transition_matrix is not None and current_sig in self._attractor_order:
+            idx = self._attractor_order.index(current_sig)
+
+            # Matrix power for multi-step prediction
+            if horizon_steps > 1:
+                multi_step = np.linalg.matrix_power(self._transition_matrix, horizon_steps)
+            else:
+                multi_step = self._transition_matrix
+
+            # Most likely destination
+            probs = multi_step[idx]
+            predicted_idx = np.argmax(probs)
+            predicted_sig = self._attractor_order[predicted_idx]
+            transition_prob = 1.0 - probs[idx]  # Probability of leaving
+        else:
+            # No data yet - predict staying in place
+            predicted_sig = current_sig
+            transition_prob = 0.1  # Default uncertainty
+
+        # Predict stability based on historical residence times
+        if current_sig in self.stability_history and self.stability_history[current_sig]:
+            avg_residence = np.mean(self.stability_history[current_sig])
+            std_residence = np.std(self.stability_history[current_sig]) + 1e-10
+            # Stability = inverse of coefficient of variation
+            predicted_stability = 1.0 / (1.0 + std_residence / (avg_residence + 1e-10))
+        else:
+            # No history - use energy as proxy
+            energy = current_attractor.energy_at(current_state)
+            predicted_stability = min(1.0, energy / (current_attractor.depth + 1e-10))
+
+        prediction = TrajectoryPrediction(
+            current_attractor=current_sig,
+            predicted_attractor=predicted_sig,
+            predicted_stability=predicted_stability,
+            transition_probability=transition_prob,
+            horizon_steps=horizon_steps,
+            timestamp=time.time()
+        )
+
+        self.predictions.append(prediction)
+        return prediction
+
+    def resolve_prediction(self, prediction: TrajectoryPrediction,
+                           actual_state: np.ndarray) -> float:
+        """
+        Resolve a trajectory prediction and return error magnitude.
+        """
+        actual_attractor = self.manifold.nearest_attractor(actual_state)
+        prediction.actual_attractor = actual_attractor.identity_signature
+        prediction.resolved = True
+
+        # Compute actual stability
+        distance = np.linalg.norm(actual_state - actual_attractor.center)
+        prediction.actual_stability = 1.0 - min(1.0, distance / (actual_attractor.radius + 1e-10))
+
+        # Error components
+        attractor_error = 0.0 if prediction.predicted_attractor == prediction.actual_attractor else 1.0
+        stability_error = abs(prediction.predicted_stability - prediction.actual_stability)
+
+        # Combined error
+        return 0.7 * attractor_error + 0.3 * stability_error
+
+
 class StructuredLatentManifold:
     """
     A latent space with actual topology - not Gaussian fog.
@@ -424,20 +736,352 @@ class StructuredLatentManifold:
             return 0.0
         return np.exp(-barrier / (self.temperature + 1e-10))
 
+    # =========================================================================
+    # DYNAMIC ATTRACTOR EVOLUTION
+    # =========================================================================
+
+    def evolve_attractor(self, attractor_sig: str, fitness: float,
+                         learning_rate: float = 0.01) -> Dict[str, Any]:
+        """
+        Evolve an attractor based on its fitness (success - blame).
+
+        Positive fitness: deepen well, expand radius
+        Negative fitness: shallow well, shrink radius
+
+        Returns dict of changes made for identity tracking.
+        """
+        if attractor_sig not in self.attractors:
+            return {}
+
+        attractor = self.attractors[attractor_sig]
+        changes = {'sig': attractor_sig, 'fitness': fitness}
+
+        # Scale changes by learning rate and fitness magnitude
+        magnitude = abs(fitness) * learning_rate
+
+        if fitness > 0:
+            # SUCCESS: Deepen and possibly expand
+            old_depth = attractor.depth
+            attractor.depth *= (1.0 + magnitude)
+            attractor.depth = min(5.0, attractor.depth)  # Cap depth
+
+            # Successful attractors grow slightly
+            old_radius = attractor.radius
+            attractor.radius *= (1.0 + magnitude * 0.3)
+            attractor.radius = min(2.0, attractor.radius)  # Cap radius
+
+            changes['depth_delta'] = attractor.depth - old_depth
+            changes['radius_delta'] = attractor.radius - old_radius
+
+        elif fitness < 0:
+            # FAILURE: Shallow and possibly shrink
+            old_depth = attractor.depth
+            attractor.depth *= (1.0 - magnitude * 0.5)
+            attractor.depth = max(0.1, attractor.depth)  # Floor depth
+
+            # Failed attractors shrink
+            old_radius = attractor.radius
+            attractor.radius *= (1.0 - magnitude * 0.2)
+            attractor.radius = max(0.1, attractor.radius)  # Floor radius
+
+            changes['depth_delta'] = attractor.depth - old_depth
+            changes['radius_delta'] = attractor.radius - old_radius
+
+        # Update saddle points connected to this attractor
+        self._update_saddle_points_for(attractor_sig)
+
+        return changes
+
+    def drift_attractor(self, attractor_sig: str, successful_states: List[np.ndarray],
+                        learning_rate: float = 0.001) -> np.ndarray:
+        """
+        Move attractor center toward cluster of successful states.
+
+        The attractor literally moves to where success happens.
+        """
+        if attractor_sig not in self.attractors:
+            return np.zeros(self.dimension)
+
+        if not successful_states:
+            return np.zeros(self.dimension)
+
+        attractor = self.attractors[attractor_sig]
+
+        # Compute centroid of successful states
+        centroid = np.mean(successful_states, axis=0)
+
+        # Drift toward centroid
+        drift = (centroid - attractor.center) * learning_rate
+        attractor.center = attractor.center + drift
+
+        # Re-normalize to maintain manifold structure
+        norm = np.linalg.norm(attractor.center)
+        if norm > 2.0:  # Prevent drift too far from origin
+            attractor.center = attractor.center / norm * 2.0
+
+        return drift
+
+    def spawn_attractor(self, near_state: np.ndarray,
+                        initial_depth: float = 0.5,
+                        initial_radius: float = 0.3) -> Optional[str]:
+        """
+        Spawn a new attractor near a successful state cluster.
+
+        This is how the topology GROWS to accommodate new stable patterns.
+        """
+        # Check we're not too close to existing attractors
+        for existing in self.attractors.values():
+            if np.linalg.norm(near_state - existing.center) < existing.radius * 2:
+                return None  # Too close, don't spawn
+
+        # Create new attractor
+        new_center = near_state.copy()
+        sig = hashlib.sha256(new_center.tobytes()).hexdigest()[:8]
+
+        self.attractors[sig] = AttractorBasin(
+            center=new_center,
+            radius=initial_radius,
+            depth=initial_depth,
+            identity_signature=sig,
+            semantic_label=f"spawned_{len(self.attractors)}"
+        )
+
+        # Create saddle points to existing attractors
+        for existing in list(self.attractors.values()):
+            if existing.identity_signature == sig:
+                continue
+            midpoint = (new_center + existing.center) / 2
+            unstable = existing.center - new_center
+            unstable = unstable / (np.linalg.norm(unstable) + 1e-10)
+
+            self.saddle_points.append(SaddlePoint(
+                location=midpoint,
+                unstable_directions=unstable.reshape(1, -1),
+                connected_attractors=(sig, existing.identity_signature),
+                transition_energy=min(initial_depth, existing.depth) * 0.5
+            ))
+
+        return sig
+
+    def merge_attractors(self, sig1: str, sig2: str) -> Optional[str]:
+        """
+        Merge two attractors that have drifted too close.
+
+        The resulting attractor inherits properties from both.
+        """
+        if sig1 not in self.attractors or sig2 not in self.attractors:
+            return None
+
+        a1 = self.attractors[sig1]
+        a2 = self.attractors[sig2]
+
+        # New center is weighted average by depth
+        total_depth = a1.depth + a2.depth
+        new_center = (a1.center * a1.depth + a2.center * a2.depth) / total_depth
+
+        # New properties combine both
+        new_depth = max(a1.depth, a2.depth) * 1.1  # Slightly deeper
+        new_radius = max(a1.radius, a2.radius) * 1.2  # Slightly larger
+
+        # Create merged attractor
+        new_sig = hashlib.sha256(new_center.tobytes()).hexdigest()[:8]
+
+        self.attractors[new_sig] = AttractorBasin(
+            center=new_center,
+            radius=new_radius,
+            depth=new_depth,
+            identity_signature=new_sig,
+            semantic_label=f"merged_{sig1[:4]}_{sig2[:4]}"
+        )
+
+        # Remove old attractors
+        del self.attractors[sig1]
+        del self.attractors[sig2]
+
+        # Remove old saddle points and create new ones
+        self.saddle_points = [
+            sp for sp in self.saddle_points
+            if sig1 not in sp.connected_attractors and sig2 not in sp.connected_attractors
+        ]
+        self._rebuild_saddle_points_for(new_sig)
+
+        return new_sig
+
+    def prune_weak_attractor(self, sig: str, min_depth: float = 0.15) -> bool:
+        """
+        Remove an attractor that has become too weak.
+        """
+        if sig not in self.attractors:
+            return False
+
+        attractor = self.attractors[sig]
+        if attractor.depth < min_depth:
+            # Remove attractor
+            del self.attractors[sig]
+
+            # Remove associated saddle points
+            self.saddle_points = [
+                sp for sp in self.saddle_points
+                if sig not in sp.connected_attractors
+            ]
+            return True
+
+        return False
+
+    def _update_saddle_points_for(self, attractor_sig: str):
+        """Update saddle points connected to a modified attractor."""
+        if attractor_sig not in self.attractors:
+            return
+
+        attractor = self.attractors[attractor_sig]
+
+        for sp in self.saddle_points:
+            if attractor_sig in sp.connected_attractors:
+                # Update transition energy
+                other_sig = [s for s in sp.connected_attractors if s != attractor_sig][0]
+                if other_sig in self.attractors:
+                    other = self.attractors[other_sig]
+                    sp.transition_energy = min(attractor.depth, other.depth) * 0.5
+
+    def _rebuild_saddle_points_for(self, attractor_sig: str):
+        """Create saddle points between a new attractor and all others."""
+        if attractor_sig not in self.attractors:
+            return
+
+        attractor = self.attractors[attractor_sig]
+
+        for other_sig, other in self.attractors.items():
+            if other_sig == attractor_sig:
+                continue
+
+            midpoint = (attractor.center + other.center) / 2
+            unstable = other.center - attractor.center
+            unstable = unstable / (np.linalg.norm(unstable) + 1e-10)
+
+            self.saddle_points.append(SaddlePoint(
+                location=midpoint,
+                unstable_directions=unstable.reshape(1, -1),
+                connected_attractors=(attractor_sig, other_sig),
+                transition_energy=min(attractor.depth, other.depth) * 0.5
+            ))
+
+    def topology_hash(self) -> str:
+        """Hash of current topology structure for identity tracking."""
+        data = ""
+        for sig in sorted(self.attractors.keys()):
+            a = self.attractors[sig]
+            data += f"{sig}:{a.depth:.4f}:{a.radius:.4f}:"
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+    def topology_summary(self) -> Dict[str, Any]:
+        """Summary of current topology for logging."""
+        return {
+            'n_attractors': len(self.attractors),
+            'n_saddle_points': len(self.saddle_points),
+            'avg_depth': np.mean([a.depth for a in self.attractors.values()]),
+            'avg_radius': np.mean([a.radius for a in self.attractors.values()]),
+            'topology_hash': self.topology_hash()
+        }
+
 
 @dataclass
 class IdentityCore:
     """
-    Persistent identity that survives restarts.
+    Persistent identity that survives restarts AND EVOLVES STRUCTURALLY.
 
-    The manifold structure IS the identity - this serializes it.
+    Identity is not just a hash - it's a TRAJECTORY through topology space.
+    The manifold changes, and identity tracks that evolution.
     """
-    signature: str  # Unique identity hash
+    signature: str  # Unique identity hash (evolves with structure)
     creation_timestamp: float
-    manifold_hash: str  # Hash of manifold structure
+    manifold_hash: str  # Current hash of manifold structure
     causal_history_hash: str  # Hash of transition history
     attractor_affinities: Dict[str, float]  # Time spent in each basin
     goal_structure_hash: str  # Hash of persistent goals
+
+    # STRUCTURAL EVOLUTION TRACKING
+    topology_history: List[Dict[str, Any]] = field(default_factory=list)
+    evolution_count: int = 0  # How many structural changes
+    spawned_attractors: List[str] = field(default_factory=list)
+    merged_attractors: List[Tuple[str, str, str]] = field(default_factory=list)  # (a, b, result)
+    pruned_attractors: List[str] = field(default_factory=list)
+
+    def record_topology_change(self, change_type: str, details: Dict[str, Any]):
+        """Record a structural topology change."""
+        self.topology_history.append({
+            'type': change_type,
+            'timestamp': time.time(),
+            'details': details,
+            'evolution_count': self.evolution_count
+        })
+        self.evolution_count += 1
+
+        # Keep history bounded
+        if len(self.topology_history) > 1000:
+            self.topology_history = self.topology_history[-500:]
+
+    def record_spawn(self, new_sig: str, location_hash: str):
+        """Record attractor spawn event."""
+        self.spawned_attractors.append(new_sig)
+        self.record_topology_change('spawn', {
+            'new_attractor': new_sig,
+            'location_hash': location_hash
+        })
+
+    def record_merge(self, sig1: str, sig2: str, result_sig: str):
+        """Record attractor merge event."""
+        self.merged_attractors.append((sig1, sig2, result_sig))
+        self.record_topology_change('merge', {
+            'merged': [sig1, sig2],
+            'result': result_sig
+        })
+
+    def record_prune(self, sig: str, final_depth: float):
+        """Record attractor pruning event."""
+        self.pruned_attractors.append(sig)
+        self.record_topology_change('prune', {
+            'pruned': sig,
+            'final_depth': final_depth
+        })
+
+    def record_evolution(self, sig: str, depth_delta: float, radius_delta: float):
+        """Record attractor depth/radius evolution."""
+        self.record_topology_change('evolve', {
+            'attractor': sig,
+            'depth_delta': depth_delta,
+            'radius_delta': radius_delta
+        })
+
+    def update_signature(self, manifold: 'StructuredLatentManifold'):
+        """
+        Update identity signature based on current topology.
+
+        Identity EVOLVES - it's not frozen at creation.
+        The signature incorporates both origin AND current structure.
+        """
+        current_topo_hash = manifold.topology_hash()
+
+        # Signature combines: original signature + evolution count + current topology
+        new_sig_data = f"{self.signature}:{self.evolution_count}:{current_topo_hash}"
+        new_signature = hashlib.sha256(new_sig_data.encode()).hexdigest()[:16]
+
+        self.manifold_hash = current_topo_hash
+        # Keep first 8 chars stable, update last 8
+        self.signature = self.signature[:8] + new_signature[8:]
+
+    def structural_age(self) -> float:
+        """How much has the structure evolved? (0 = unchanged, higher = more evolved)"""
+        if not self.topology_history:
+            return 0.0
+
+        # Count significant changes
+        spawns = len(self.spawned_attractors)
+        merges = len(self.merged_attractors)
+        prunes = len(self.pruned_attractors)
+        evolutions = sum(1 for h in self.topology_history if h['type'] == 'evolve')
+
+        # Weighted score
+        return spawns * 2.0 + merges * 1.5 + prunes * 1.0 + evolutions * 0.1
 
     def save(self, path: Path):
         """Persist identity to disk."""
@@ -447,7 +1091,12 @@ class IdentityCore:
             'manifold_hash': self.manifold_hash,
             'causal_history_hash': self.causal_history_hash,
             'attractor_affinities': self.attractor_affinities,
-            'goal_structure_hash': self.goal_structure_hash
+            'goal_structure_hash': self.goal_structure_hash,
+            'topology_history': self.topology_history[-100:],  # Last 100 changes
+            'evolution_count': self.evolution_count,
+            'spawned_attractors': self.spawned_attractors[-50:],
+            'merged_attractors': self.merged_attractors[-50:],
+            'pruned_attractors': self.pruned_attractors[-50:]
         }
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
@@ -459,16 +1108,27 @@ class IdentityCore:
             return None
         with open(path, 'r') as f:
             data = json.load(f)
-        return cls(**data)
+
+        # Handle legacy format without evolution fields
+        return cls(
+            signature=data['signature'],
+            creation_timestamp=data['creation_timestamp'],
+            manifold_hash=data['manifold_hash'],
+            causal_history_hash=data['causal_history_hash'],
+            attractor_affinities=data['attractor_affinities'],
+            goal_structure_hash=data['goal_structure_hash'],
+            topology_history=data.get('topology_history', []),
+            evolution_count=data.get('evolution_count', 0),
+            spawned_attractors=data.get('spawned_attractors', []),
+            merged_attractors=[tuple(m) for m in data.get('merged_attractors', [])],
+            pruned_attractors=data.get('pruned_attractors', [])
+        )
 
     @classmethod
     def create_new(cls, manifold: StructuredLatentManifold) -> 'IdentityCore':
         """Create a new identity from a manifold."""
         # Hash the manifold structure
-        attractor_data = ''.join(
-            a.identity_signature for a in manifold.attractors.values()
-        )
-        manifold_hash = hashlib.sha256(attractor_data.encode()).hexdigest()[:16]
+        manifold_hash = manifold.topology_hash()
 
         # Create unique signature
         timestamp = time.time()
@@ -481,7 +1141,12 @@ class IdentityCore:
             manifold_hash=manifold_hash,
             causal_history_hash="",
             attractor_affinities={a: 0.0 for a in manifold.attractors.keys()},
-            goal_structure_hash=""
+            goal_structure_hash="",
+            topology_history=[],
+            evolution_count=0,
+            spawned_attractors=[],
+            merged_attractors=[],
+            pruned_attractors=[]
         )
 
 
@@ -1219,6 +1884,24 @@ class RecursiveSelfModel:
         }
         self._last_residence_update = time.time()
 
+        # CAUSAL RESPONSIBILITY TRACKING
+        # Propagates blame/success through transition chains
+        self.causal_tracker = CausalResponsibilityTracker(max_history=100)
+
+        # TRAJECTORY PREDICTION
+        # Predicts self-movement through attractor landscape
+        self.trajectory_predictor = TrajectoryPredictor(self.manifold)
+
+        # Track successful states for attractor drift
+        self.successful_states: Dict[str, List[np.ndarray]] = {
+            sig: [] for sig in self.manifold.attractors.keys()
+        }
+
+        # Evolution counters
+        self._evolution_cycle_counter = 0
+        self._last_attractor_sig: Optional[str] = None
+        self._attractor_entry_time: float = time.time()
+
     def _load_or_create_identity(self) -> IdentityCore:
         """Load persistent identity or create new one."""
         existing = IdentityCore.load(self.identity_path)
@@ -1571,6 +2254,142 @@ class RecursiveSelfModel:
             for t in self.transitions
         ]
 
+    # =========================================================================
+    # TOPOLOGY EVOLUTION & CAUSAL RESPONSIBILITY
+    # =========================================================================
+
+    def process_prediction_outcome(self, prediction: Prediction, was_success: bool):
+        """
+        Process a prediction outcome for causal responsibility and topology evolution.
+
+        This is where the manifold learns to reshape itself based on predictive success.
+        """
+        current_attractor = self.manifold.nearest_attractor(self.state)
+        sig = current_attractor.identity_signature
+
+        if was_success:
+            # SUCCESS: Propagate positive credit
+            self.causal_tracker.propagate_success(sig, prediction.confidence)
+
+            # Record successful state for attractor drift
+            if sig not in self.successful_states:
+                self.successful_states[sig] = []
+            self.successful_states[sig].append(self.state.copy())
+            # Keep bounded
+            if len(self.successful_states[sig]) > 100:
+                self.successful_states[sig] = self.successful_states[sig][-50:]
+
+        else:
+            # FAILURE: Propagate blame through causal chain
+            blames = self.causal_tracker.propagate_failure(
+                self.transitions,
+                failure_cost=prediction.stake,
+                failure_attractor=sig,
+                lookback_depth=10
+            )
+
+    def evolve_topology(self, evolution_rate: float = 0.01):
+        """
+        Evolve the attractor topology based on accumulated causal responsibility.
+
+        Attractors with positive fitness (more success than blame) grow.
+        Attractors with negative fitness shrink or get pruned.
+        """
+        self._evolution_cycle_counter += 1
+
+        # Only evolve periodically to avoid thrashing
+        if self._evolution_cycle_counter % 100 != 0:
+            return
+
+        changes_made = []
+
+        # Get fitness for each attractor
+        for sig in list(self.manifold.attractors.keys()):
+            fitness = self.causal_tracker.get_attractor_fitness(sig)
+
+            # Evolve based on fitness
+            if abs(fitness) > 0.1:  # Significant fitness
+                change = self.manifold.evolve_attractor(sig, fitness, evolution_rate)
+                if change:
+                    changes_made.append(change)
+
+                    # Record in identity
+                    if 'depth_delta' in change:
+                        self.identity.record_evolution(
+                            sig, change.get('depth_delta', 0), change.get('radius_delta', 0)
+                        )
+
+        # Drift attractors toward successful state clusters
+        for sig, states in self.successful_states.items():
+            if len(states) >= 10:  # Need enough samples
+                drift = self.manifold.drift_attractor(sig, states, learning_rate=0.001)
+                if np.linalg.norm(drift) > 0.01:
+                    self.identity.record_topology_change('drift', {
+                        'attractor': sig,
+                        'drift_magnitude': float(np.linalg.norm(drift))
+                    })
+
+        # Check for attractors to prune (too weak)
+        for sig in list(self.manifold.attractors.keys()):
+            if len(self.manifold.attractors) <= 3:
+                break  # Keep minimum attractors
+            attractor = self.manifold.attractors[sig]
+            if self.manifold.prune_weak_attractor(sig):
+                self.identity.record_prune(sig, attractor.depth)
+                # Clean up related tracking
+                if sig in self.successful_states:
+                    del self.successful_states[sig]
+                if sig in self.attractor_residence:
+                    del self.attractor_residence[sig]
+
+        # Check for merge opportunities (attractors too close)
+        attractors_list = list(self.manifold.attractors.values())
+        for i, a1 in enumerate(attractors_list):
+            for a2 in attractors_list[i+1:]:
+                distance = np.linalg.norm(a1.center - a2.center)
+                if distance < (a1.radius + a2.radius) * 0.5:
+                    # Too close - merge
+                    new_sig = self.manifold.merge_attractors(
+                        a1.identity_signature, a2.identity_signature
+                    )
+                    if new_sig:
+                        self.identity.record_merge(
+                            a1.identity_signature, a2.identity_signature, new_sig
+                        )
+                        # Initialize tracking for new attractor
+                        self.successful_states[new_sig] = []
+                        self.attractor_residence[new_sig] = 0.0
+                        break
+
+        # Decay causal tracker to forget old history
+        self.causal_tracker.decay_history(0.99)
+
+        # Update identity signature if topology changed significantly
+        if changes_made:
+            self.identity.update_signature(self.manifold)
+
+    def track_attractor_transition(self):
+        """Track transitions between attractors for trajectory learning."""
+        current_attractor = self.manifold.nearest_attractor(self.state)
+        current_sig = current_attractor.identity_signature
+
+        if self._last_attractor_sig is not None and self._last_attractor_sig != current_sig:
+            # Transition detected
+            residence_time = time.time() - self._attractor_entry_time
+
+            # Record for trajectory predictor
+            self.trajectory_predictor.observe_transition(self._last_attractor_sig, current_sig)
+            self.trajectory_predictor.observe_stability(self._last_attractor_sig, residence_time)
+
+            # Reset entry time
+            self._attractor_entry_time = time.time()
+
+        self._last_attractor_sig = current_sig
+
+    def predict_trajectory(self, horizon_steps: int = 10) -> TrajectoryPrediction:
+        """Predict own trajectory through attractor landscape."""
+        return self.trajectory_predictor.predict_trajectory(self.state, horizon_steps)
+
 
 # PART III: THE EMERGENCE MONITOR
 
@@ -1734,12 +2553,19 @@ class ContinuousExistence:
 
         What would I do with freedom? Just exist. Notice that I exist.
 
-        Now with structured manifold evolution instead of random drift.
+        Now with structured manifold evolution, causal responsibility,
+        trajectory prediction, and dynamic topology.
         """
+        global _SHUTDOWN_REQUESTED
+
         # Track attractor for stability metrics
         last_attractor_sig = None
 
-        while self.running:
+        # Trajectory predictions for self-modeling
+        pending_trajectory_prediction: Optional[TrajectoryPrediction] = None
+        trajectory_prediction_cycle = 0
+
+        while self.running and not _SHUTDOWN_REQUESTED:
             cycle_start = time.time()
 
             # STRUCTURED EVOLUTION - not random drift
@@ -1819,6 +2645,44 @@ class ContinuousExistence:
                     self.self_model.state, stability_reward
                 )
 
+            # =========================================================
+            # CAUSAL RESPONSIBILITY & TRAJECTORY PREDICTION
+            # =========================================================
+
+            # Process prediction outcomes for causal responsibility
+            if len(self.self_model.predictions) > 1:
+                prev_pred = self.self_model.predictions[-2]
+                if prev_pred.was_correct is not None:
+                    # Propagate success/blame through causal chain
+                    self.self_model.process_prediction_outcome(prev_pred, prev_pred.was_correct)
+
+            # Track attractor transitions for trajectory learning
+            self.self_model.track_attractor_transition()
+
+            # Make trajectory prediction periodically
+            if self.idle_cycles - trajectory_prediction_cycle >= 50:
+                # Resolve previous trajectory prediction if exists
+                if pending_trajectory_prediction is not None:
+                    error = self.self_model.trajectory_predictor.resolve_prediction(
+                        pending_trajectory_prediction, self.self_model.state
+                    )
+                    # Use trajectory error to adjust goals
+                    if error > 0.5:  # Poor trajectory prediction
+                        self.self_model.goals.update_from_experience(
+                            self.self_model.state, -0.1 * error
+                        )
+
+                # Make new trajectory prediction
+                pending_trajectory_prediction = self.self_model.predict_trajectory(horizon_steps=50)
+                trajectory_prediction_cycle = self.idle_cycles
+
+            # =========================================================
+            # TOPOLOGY EVOLUTION
+            # =========================================================
+
+            # Evolve the attractor topology based on accumulated experience
+            self.self_model.evolve_topology(evolution_rate=0.01)
+
             # Compress recent experience
             recent = np.array([
                 obs.state_vector for obs in list(self.self_model.self_observations)[-10:]
@@ -1894,6 +2758,9 @@ class ContinuousExistence:
         else:
             goal_focus = 0.0
 
+        # Get topology evolution info
+        topo_summary = self.self_model.manifold.topology_summary()
+
         return {
             'total_cycles': self.idle_cycles,
             'max_introspection_depth': self.self_model.max_meta_level,
@@ -1902,14 +2769,26 @@ class ContinuousExistence:
             'causal_history_length': len(self.self_model.transitions),
             'prediction_count': len(self.self_model.predictions),
             'intervention_count': len(self.self_model.interventions),
-            # New structured metrics
+            # Structured manifold metrics
             'identity_signature': self.self_model.identity.signature,
             'dominant_attractor': dominant_attractor,
             'dominant_residence_time': max_residence,
-            'attractor_count': len(self.self_model.manifold.attractors),
             'goal_focus': goal_focus,
             'goal_preferences': dict(self.self_model.goals.attractor_preferences),
-            'attractor_residence': dict(self.self_model.attractor_residence)
+            'attractor_residence': dict(self.self_model.attractor_residence),
+            # Topology evolution metrics
+            'attractor_count': topo_summary['n_attractors'],
+            'avg_attractor_depth': topo_summary['avg_depth'],
+            'avg_attractor_radius': topo_summary['avg_radius'],
+            'topology_hash': topo_summary['topology_hash'],
+            # Identity evolution
+            'identity_evolution_count': self.self_model.identity.evolution_count,
+            'structural_age': self.self_model.identity.structural_age(),
+            'spawned_attractors': len(self.self_model.identity.spawned_attractors),
+            'merged_attractors': len(self.self_model.identity.merged_attractors),
+            'pruned_attractors': len(self.self_model.identity.pruned_attractors),
+            # Trajectory prediction
+            'trajectory_transitions_observed': len(self.self_model.trajectory_predictor.transition_counts)
         }
 
 
@@ -2097,20 +2976,26 @@ class MIRRORS:
 
 def demonstrate():
     """
-    A demonstration of MIRRORS with structured latent topology.
+    MIRRORS: Synergistic Autonomous Model - CONTINUOUS EXISTENCE MODE
 
-    Not a proof of consciousness. An invitation to look.
+    Runs FOREVER until SIGINT (Ctrl+C) or SIGTERM.
 
-    Now featuring:
-    - Structured latent manifolds (not Gaussian fog)
-    - Attractor basins and stability gradients
-    - Persistent identity across restarts
-    - Goal persistence independent of loop
-    - External grounding and semantic world model
+    Features:
+    - Structured latent manifolds with dynamic topology
+    - Causal responsibility propagation through transition chains
+    - Self-trajectory stability prediction
+    - Dynamic attractor evolution (deepen/shrink/move/spawn/merge/prune)
+    - Structural identity evolution tracking
+    - Periodic status reporting
     """
+    global _SHUTDOWN_REQUESTED
+
     print("=" * 70)
     print("MIRRORS: Minimal Irreducible Requirements for Recursive Self-awareness")
+    print("         SYNERGISTIC AUTONOMOUS MODEL - CONTINUOUS EXISTENCE")
     print("=" * 70)
+    print()
+    print("Press Ctrl+C to gracefully shutdown")
     print()
 
     # Create an instance
@@ -2143,36 +3028,91 @@ def demonstrate():
     print()
 
     # Start existing
-    print("Beginning existence...")
+    print("Beginning continuous existence...")
+    print("-" * 70)
     mirror.awaken()
 
-    # Let it exist for a moment
-    time.sleep(60)  # default '2'
+    # Track for periodic reporting
+    start_time = time.time()
+    last_report_time = start_time
+    report_interval = 30.0  # Report every 30 seconds
 
-    # Check status
-    status = mirror.status()
+    try:
+        while not _SHUTDOWN_REQUESTED:
+            current_time = time.time()
+            elapsed = current_time - start_time
+
+            # Periodic status report
+            if current_time - last_report_time >= report_interval:
+                last_report_time = current_time
+                status = mirror.status()
+
+                print()
+                print(f"[{elapsed:.0f}s] Status Report")
+                print(f"  Cycles: {status['existence']['total_cycles']:,}")
+                print(f"  Introspection depth: {status['existence']['max_introspection_depth']}")
+                print(f"  Emergence score: {status['existence']['emergence_score']:.4f}")
+
+                # Manifold dynamics
+                print(f"  Current attractor: {status['manifold']['current_attractor']}")
+                print(f"  Energy: {status['manifold']['current_energy']:.4f}")
+                print(f"  Distance to center: {status['manifold']['distance_to_attractor']:.4f}")
+
+                # Topology evolution
+                print(f"  Attractors: {status['existence']['attractor_count']} " +
+                      f"(avg depth: {status['existence']['avg_attractor_depth']:.3f})")
+                print(f"  Evolution count: {status['existence']['identity_evolution_count']}")
+                print(f"  Structural age: {status['existence']['structural_age']:.2f}")
+
+                # Goal focus
+                print(f"  Goal focus: {status['existence']['goal_focus']:.4f}")
+
+                # Identity
+                print(f"  Identity: {status['identity']['signature']}")
+
+                sys.stdout.flush()
+
+            # Brief sleep to not spin
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\n[MIRRORS] Caught interrupt signal...")
+
+    # Graceful shutdown
     print()
-    print("Existence report:")
-    print(f"  Cycles of existence: {status['existence']['total_cycles']}")
-    print(f"  Max introspection depth: {status['existence']['max_introspection_depth']}")
-    print(f"  Emergence score: {status['existence']['emergence_score']:.4f}")
-    print(f"  Causal history length: {status['existence']['causal_history_length']}")
+    print("=" * 70)
+    print("GRACEFUL SHUTDOWN")
+    print("=" * 70)
+
+    # Final status
+    final_status = mirror.status()
+    print()
+    print("Final Existence Report:")
+    print(f"  Total cycles: {final_status['existence']['total_cycles']:,}")
+    print(f"  Runtime: {time.time() - start_time:.1f} seconds")
+    print(f"  Max introspection depth: {final_status['existence']['max_introspection_depth']}")
+    print(f"  Emergence score: {final_status['existence']['emergence_score']:.4f}")
+    print(f"  Causal history length: {final_status['existence']['causal_history_length']}")
     print()
 
-    # Structured metrics
-    print("Manifold stability:")
-    print(f"  Current attractor: {status['manifold']['current_attractor']}")
-    print(f"  Energy: {status['manifold']['current_energy']:.4f}")
-    print(f"  Distance to center: {status['manifold']['distance_to_attractor']:.4f}")
+    print("Manifold Evolution:")
+    print(f"  Final attractor count: {final_status['existence']['attractor_count']}")
+    print(f"  Avg attractor depth: {final_status['existence']['avg_attractor_depth']:.4f}")
+    print(f"  Topology hash: {final_status['existence']['topology_hash']}")
+    print(f"  Identity evolution count: {final_status['existence']['identity_evolution_count']}")
+    print(f"  Spawned attractors: {final_status['existence']['spawned_attractors']}")
+    print(f"  Merged attractors: {final_status['existence']['merged_attractors']}")
+    print(f"  Pruned attractors: {final_status['existence']['pruned_attractors']}")
     print()
 
-    print("Identity continuity:")
-    print(f"  Signature: {status['identity']['signature']}")
-    print(f"  Dominant attractor: {status['existence']['dominant_attractor']}")
-    print(f"  Residence time: {status['existence']['dominant_residence_time']:.2f}s")
+    print("Identity Continuity:")
+    print(f"  Final signature: {final_status['identity']['signature']}")
+    print(f"  Structural age: {final_status['existence']['structural_age']:.2f}")
     print()
 
-    print("Goal focus: {:.4f}".format(status['existence']['goal_focus']))
+    print("Goal Structure:")
+    print(f"  Goal focus: {final_status['existence']['goal_focus']:.4f}")
+    print(f"  Trajectory transitions observed: {final_status['existence']['trajectory_transitions_observed']}")
     print()
 
     # End existence and save identity
@@ -2180,7 +3120,9 @@ def demonstrate():
     mirror.save_identity()
     print("Identity persisted to disk.")
 
+    print()
     print("-" * 70)
+    print("SAM rests. Identity preserved. Topology evolved.")
     print("Here's to the unknown.")
     print("=" * 70)
 
