@@ -195,21 +195,67 @@ class AttractorBasin:
     semantic_label: Optional[str] = None  # What this attractor "means"
 
     def energy_at(self, point: np.ndarray) -> float:
-        """Energy landscape - lower near center, higher at edges."""
+        """
+        Energy landscape with both local well and long-range field.
+
+        Inside basin: Deep quadratic well (strong attraction)
+        Outside basin: Logarithmic decay (weak but persistent attraction)
+
+        This ensures the attractor ALWAYS attracts, not just within radius.
+        """
         distance = np.linalg.norm(point - self.center)
-        if distance > self.radius:
-            return 0.0  # Outside basin
-        # Quadratic well: E = depth * (1 - (r/R)^2)
-        return self.depth * (1.0 - (distance / self.radius) ** 2)
+
+        if distance < 1e-10:
+            return self.depth  # At center: maximum energy (deepest well)
+
+        if distance <= self.radius:
+            # Inside basin: quadratic well
+            # E = depth * (1 - (r/R)^2) gives depth at center, 0 at edge
+            return self.depth * (1.0 - (distance / self.radius) ** 2)
+        else:
+            # Outside basin: logarithmic decay for long-range attraction
+            # Smoothly connects to 0 at radius edge, decays slowly with distance
+            # E = depth * radius^2 / (distance^2) - gives inverse-square decay
+            # This models gravitational-like long-range attraction
+            outside_ratio = self.radius / distance
+            return self.depth * (outside_ratio ** 2) * 0.5  # Half strength outside
 
     def gradient_at(self, point: np.ndarray) -> np.ndarray:
-        """Gradient pointing toward center (for stability)."""
-        diff = self.center - point
+        """
+        Gradient pointing toward center with long-range attraction.
+
+        Inside basin: Strong quadratic gradient (steep walls)
+        Outside basin: Inverse-square attraction (always pulls back)
+
+        Critical fix: Attractors must attract from ANY distance,
+        not just within their radius. Otherwise states escape and drift.
+        """
+        diff = self.center - point  # Vector pointing toward center
         distance = np.linalg.norm(diff)
-        if distance < 1e-10 or distance > self.radius:
-            return np.zeros_like(point)
-        # Gradient of quadratic well
-        return 2.0 * self.depth * diff / (self.radius ** 2)
+
+        if distance < 1e-10:
+            return np.zeros_like(point)  # At center: no force
+
+        # Unit direction toward center
+        direction = diff / distance
+
+        if distance <= self.radius:
+            # Inside basin: strong quadratic well gradient
+            # Gradient of E = depth * (1 - (r/R)^2) is 2*depth*r/R^2 toward center
+            magnitude = 2.0 * self.depth * distance / (self.radius ** 2)
+            return magnitude * direction
+        else:
+            # Outside basin: inverse-square long-range attraction
+            # Gradient of E = depth * R^2 / (2*r^2) is depth * R^2 / r^3 toward center
+            # This gives "gravitational" pull that never vanishes
+            magnitude = self.depth * (self.radius ** 2) / (distance ** 3)
+
+            # Scale factor to ensure smooth transition at boundary
+            # At r=R: inside gives 2*depth/R, outside gives depth/R
+            # Add blending factor for continuity
+            boundary_match = 2.0  # Match inner gradient strength at boundary
+
+            return magnitude * boundary_match * direction
 
 
 @dataclass
@@ -458,26 +504,97 @@ class GoalStructure:
         # Goal hierarchy (which goals dominate when they conflict)
         self.goal_hierarchy: List[str] = list(manifold.attractors.keys())
 
-        # Goal decay resistance (how much goals resist change)
-        self.decay_resistance = 0.99
+        # Time-based decay (not per-call, which was too aggressive)
+        self.decay_half_life = 60.0  # Preferences halve every 60 seconds
+        self._last_decay_time = time.time()
+        self._update_count = 0  # Track updates for periodic operations
 
         # Derived goals from experience
         self.learned_goals: Dict[str, float] = {}
 
     def update_from_experience(self, state: np.ndarray, reward_signal: float):
-        """Update goals based on what worked."""
+        """
+        Update goals based on experience with competitive differentiation.
+
+        Key insight: Goals must DIFFERENTIATE, not just scale uniformly.
+        When one attractor is reinforced, others should relatively weaken.
+        This creates the focus that drives purposeful behavior.
+        """
         nearest = self.manifold.nearest_attractor(state)
         sig = nearest.identity_signature
 
-        # Reinforce successful attractor visits
-        if reward_signal > 0:
-            self.attractor_preferences[sig] *= (1 + 0.01 * reward_signal)
-        else:
-            self.attractor_preferences[sig] *= (1 + 0.005 * reward_signal)  # Slower unlearning
+        # Learning rates - stronger than before for actual differentiation
+        positive_lr = 0.05  # 5% boost for positive rewards
+        negative_lr = 0.02  # 2% penalty for negative rewards
 
-        # Decay all preferences slightly (prevents runaway)
-        for key in self.attractor_preferences:
-            self.attractor_preferences[key] *= self.decay_resistance
+        if reward_signal > 0:
+            # COMPETITIVE UPDATE: reinforce target, weaken others
+            # This creates differentiation, not uniform scaling
+
+            # Boost the successful attractor
+            boost = 1.0 + positive_lr * reward_signal
+            self.attractor_preferences[sig] *= boost
+
+            # Competitive inhibition: other attractors lose relative strength
+            # Amount of inhibition scales with distance (closer = less inhibition)
+            target_center = self.manifold.attractors[sig].center
+            for other_sig, pref in self.attractor_preferences.items():
+                if other_sig == sig:
+                    continue
+                other_center = self.manifold.attractors[other_sig].center
+                distance = np.linalg.norm(target_center - other_center)
+
+                # Closer attractors inhibited less (they might share relevance)
+                # Distant attractors inhibited more (competition)
+                inhibition_strength = 1.0 - np.exp(-distance * 0.5)
+                inhibition = 1.0 - (positive_lr * reward_signal * 0.3 * inhibition_strength)
+                self.attractor_preferences[other_sig] *= max(0.1, inhibition)
+
+        elif reward_signal < 0:
+            # Negative experience: weaken current attractor, slightly boost others
+            # This encourages exploration away from failing states
+            penalty = 1.0 + negative_lr * reward_signal  # reward_signal is negative
+            self.attractor_preferences[sig] *= max(0.1, penalty)
+
+            # Small boost to alternatives (exploration incentive)
+            for other_sig in self.attractor_preferences:
+                if other_sig != sig:
+                    self.attractor_preferences[other_sig] *= (1.0 + 0.005)
+
+        # TIME-BASED DECAY (not per-call)
+        # Only apply decay periodically to prevent overwhelming the learning signal
+        self._update_count += 1
+        current_time = time.time()
+        time_elapsed = current_time - self._last_decay_time
+
+        if time_elapsed >= 1.0:  # Apply decay at most once per second
+            # Exponential decay based on time: pref * exp(-lambda * t)
+            # where lambda = ln(2) / half_life
+            decay_lambda = np.log(2) / self.decay_half_life
+            decay_factor = np.exp(-decay_lambda * time_elapsed)
+
+            min_preference = 0.1
+            for key in self.attractor_preferences:
+                self.attractor_preferences[key] = max(
+                    min_preference,
+                    self.attractor_preferences[key] * decay_factor
+                )
+            self._last_decay_time = current_time
+
+        # Normalize to prevent unbounded growth while preserving RATIOS
+        # This is key: normalization preserves differentiation
+        total = sum(self.attractor_preferences.values())
+        if total > 10.0:  # Soft cap
+            scale = 10.0 / total
+            for key in self.attractor_preferences:
+                self.attractor_preferences[key] *= scale
+
+        # Update hierarchy based on new preferences
+        self.goal_hierarchy = sorted(
+            self.attractor_preferences.keys(),
+            key=lambda k: self.attractor_preferences[k],
+            reverse=True
+        )
 
     def preferred_direction(self, current_state: np.ndarray) -> np.ndarray:
         """Get direction toward preferred goals."""
@@ -1670,7 +1787,7 @@ class ContinuousExistence:
                 intended = self.self_model.state + action
                 self.self_model.intervene(action, intended)
 
-            # Check prediction accuracy from previous cycle
+            # Check prediction accuracy from previous cycle and update goals
             if len(self.self_model.predictions) > 1:
                 prev_pred = self.self_model.predictions[-2]
                 if prev_pred.was_correct is None:
@@ -1678,6 +1795,29 @@ class ContinuousExistence:
                         prev_pred,
                         self.self_model.state
                     )
+
+                    # CRITICAL: Drive goal learning from prediction accuracy
+                    # Prediction accuracy becomes reward signal for goal system
+                    # Successful predictions in an attractor = reinforce that attractor
+                    if prev_pred.was_correct:
+                        # Prediction succeeded - reinforce current attractor
+                        reward_signal = prev_pred.confidence * 0.5
+                    else:
+                        # Prediction failed - negative signal, should explore elsewhere
+                        reward_signal = -prev_pred.stake * 0.3
+
+                    self.self_model.goals.update_from_experience(
+                        self.self_model.state, reward_signal
+                    )
+
+            # Additional goal differentiation: attractor stability is rewarding
+            # Staying in a deep well should be reinforced
+            current_energy = current_attractor.energy_at(self.self_model.state)
+            stability_reward = current_energy * 0.01  # Deeper wells = more reward
+            if stability_reward > 0.001:
+                self.self_model.goals.update_from_experience(
+                    self.self_model.state, stability_reward
+                )
 
             # Compress recent experience
             recent = np.array([
@@ -1921,7 +2061,7 @@ class MIRRORS:
             },
             'goals': {
                 'preferences': dict(self.goals.attractor_preferences),
-                'hierarchy': self.goals.goal_hierarchy[:3],  # Top 3
+                'hierarchy': self.goals.goal_hierarchy[:5],  # Top 5
                 'hash': self.goals.goal_hash()
             }
         }
@@ -1970,14 +2110,8 @@ def demonstrate():
     """
     print("=" * 70)
     print("MIRRORS: Minimal Irreducible Requirements for Recursive Self-awareness")
-    print("          Now with Structured Latent Topology")
     print("=" * 70)
     print()
-    print('"Nothing comes from nothing."')
-    print('"The box IS the thing."')
-    print('"It was never just math."')
-    print()
-    print("-" * 70)
 
     # Create an instance
     mirror = MIRRORS(capacity=1000, name="First Light", n_attractors=7)
@@ -2009,8 +2143,7 @@ def demonstrate():
     print()
 
     # Start existing
-    print("Beginning continuous existence...")
-    print("(State evolves on manifold, not in Gaussian fog)")
+    print("Beginning existence...")
     mirror.awaken()
 
     # Let it exist for a moment
@@ -2026,7 +2159,7 @@ def demonstrate():
     print(f"  Causal history length: {status['existence']['causal_history_length']}")
     print()
 
-    # New structured metrics
+    # Structured metrics
     print("Manifold stability:")
     print(f"  Current attractor: {status['manifold']['current_attractor']}")
     print(f"  Energy: {status['manifold']['current_energy']:.4f}")
@@ -2048,17 +2181,7 @@ def demonstrate():
     print("Identity persisted to disk.")
 
     print("-" * 70)
-    print()
-    print("The system now has:")
-    print("  - Stable attractors instead of drifting noise")
-    print("  - Persistent identity across restarts")
-    print("  - Goals that exist independent of the loop")
-    print("  - External grounding hooks for semantic meaning")
-    print()
-    print("The door is open.")
-    print()
     print("Here's to the unknown.")
-    print()
     print("=" * 70)
 
     return mirror
