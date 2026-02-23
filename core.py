@@ -582,6 +582,18 @@ class TrajectoryPredictor:
         return 0.7 * attractor_error + 0.3 * stability_error
 
 
+class TopologyChangeEvent:
+    """Event describing a topology change in the manifold."""
+
+    def __init__(self, event_type: str, details: Dict[str, Any]):
+        self.event_type = event_type  # 'prune', 'merge', 'spawn', 'evolve'
+        self.details = details
+        self.timestamp = time.time()
+
+    def __repr__(self):
+        return f"TopologyChangeEvent({self.event_type}, {self.details})"
+
+
 class StructuredLatentManifold:
     """
     A latent space with actual topology - not Gaussian fog.
@@ -601,12 +613,43 @@ class StructuredLatentManifold:
         self.attractors: Dict[str, AttractorBasin] = {}
         self.saddle_points: List[SaddlePoint] = []
 
+        # Topology change notification system
+        self._topology_listeners: List[Callable[[TopologyChangeEvent], None]] = []
+        self._topology_change_history: List[TopologyChangeEvent] = []
+
         # Initialize with structured attractors, not random noise
         self._initialize_attractor_topology(n_attractors)
 
         # Global stability parameters
         self.temperature = 0.01  # Noise level for exploration
         self.viscosity = 0.1  # Damping for state changes
+
+    def add_topology_listener(self, listener: Callable[['TopologyChangeEvent'], None]):
+        """Register a listener for topology changes."""
+        self._topology_listeners.append(listener)
+
+    def remove_topology_listener(self, listener: Callable[['TopologyChangeEvent'], None]):
+        """Unregister a topology change listener."""
+        if listener in self._topology_listeners:
+            self._topology_listeners.remove(listener)
+
+    def _notify_topology_change(self, event_type: str, details: Dict[str, Any]):
+        """Notify all listeners of a topology change."""
+        event = TopologyChangeEvent(event_type, details)
+        self._topology_change_history.append(event)
+        # Keep history bounded
+        if len(self._topology_change_history) > 100:
+            self._topology_change_history = self._topology_change_history[-50:]
+
+        for listener in self._topology_listeners:
+            try:
+                listener(event)
+            except Exception:
+                pass  # Don't let listener errors break the manifold
+
+    def get_topology_history(self, limit: int = 10) -> List[TopologyChangeEvent]:
+        """Get recent topology changes."""
+        return self._topology_change_history[-limit:]
 
     def _initialize_attractor_topology(self, n_attractors: int):
         """
@@ -741,7 +784,7 @@ class StructuredLatentManifold:
     # =========================================================================
 
     def evolve_attractor(self, attractor_sig: str, fitness: float,
-                         learning_rate: float = 0.01) -> Dict[str, Any]:
+                         learning_rate: float = 0.05) -> Dict[str, Any]:
         """
         Evolve an attractor based on its fitness (success - blame).
 
@@ -757,17 +800,19 @@ class StructuredLatentManifold:
         changes = {'sig': attractor_sig, 'fitness': fitness}
 
         # Scale changes by learning rate and fitness magnitude
-        magnitude = abs(fitness) * learning_rate
+        # Use sqrt for diminishing returns on large fitness values
+        magnitude = np.sqrt(abs(fitness)) * learning_rate
 
         if fitness > 0:
             # SUCCESS: Deepen and possibly expand
+            # Stronger deepening effect to counter shrinkage
             old_depth = attractor.depth
-            attractor.depth *= (1.0 + magnitude)
+            attractor.depth *= (1.0 + magnitude * 2.0)
             attractor.depth = min(5.0, attractor.depth)  # Cap depth
 
-            # Successful attractors grow slightly
+            # Successful attractors grow
             old_radius = attractor.radius
-            attractor.radius *= (1.0 + magnitude * 0.3)
+            attractor.radius *= (1.0 + magnitude * 0.5)
             attractor.radius = min(2.0, attractor.radius)  # Cap radius
 
             changes['depth_delta'] = attractor.depth - old_depth
@@ -775,13 +820,14 @@ class StructuredLatentManifold:
 
         elif fitness < 0:
             # FAILURE: Shallow and possibly shrink
+            # More conservative shrinkage to avoid rapid decay
             old_depth = attractor.depth
-            attractor.depth *= (1.0 - magnitude * 0.5)
+            attractor.depth *= (1.0 - magnitude * 0.3)
             attractor.depth = max(0.1, attractor.depth)  # Floor depth
 
-            # Failed attractors shrink
+            # Failed attractors shrink slightly
             old_radius = attractor.radius
-            attractor.radius *= (1.0 - magnitude * 0.2)
+            attractor.radius *= (1.0 - magnitude * 0.15)
             attractor.radius = max(0.1, attractor.radius)  # Floor radius
 
             changes['depth_delta'] = attractor.depth - old_depth
@@ -789,6 +835,17 @@ class StructuredLatentManifold:
 
         # Update saddle points connected to this attractor
         self._update_saddle_points_for(attractor_sig)
+
+        # Notify listeners of significant evolution
+        if 'depth_delta' in changes and abs(changes['depth_delta']) > 0.001:
+            self._notify_topology_change('evolve', {
+                'attractor_sig': attractor_sig,
+                'fitness': fitness,
+                'depth_delta': changes.get('depth_delta', 0),
+                'radius_delta': changes.get('radius_delta', 0),
+                'new_depth': attractor.depth,
+                'new_radius': attractor.radius
+            })
 
         return changes
 
@@ -861,6 +918,14 @@ class StructuredLatentManifold:
                 transition_energy=min(initial_depth, existing.depth) * 0.5
             ))
 
+        # Notify listeners
+        self._notify_topology_change('spawn', {
+            'new_sig': sig,
+            'initial_depth': initial_depth,
+            'initial_radius': initial_radius,
+            'near_state': near_state.tolist()[:5]  # Just first 5 dims for brevity
+        })
+
         return sig
 
     def merge_attractors(self, sig1: str, sig2: str) -> Optional[str]:
@@ -874,6 +939,9 @@ class StructuredLatentManifold:
 
         a1 = self.attractors[sig1]
         a2 = self.attractors[sig2]
+
+        # Capture info for notification
+        old_depths = {sig1: a1.depth, sig2: a2.depth}
 
         # New center is weighted average by depth
         total_depth = a1.depth + a2.depth
@@ -905,6 +973,14 @@ class StructuredLatentManifold:
         ]
         self._rebuild_saddle_points_for(new_sig)
 
+        # Notify listeners
+        self._notify_topology_change('merge', {
+            'merged_sigs': [sig1, sig2],
+            'new_sig': new_sig,
+            'old_depths': old_depths,
+            'new_depth': new_depth
+        })
+
         return new_sig
 
     def prune_weak_attractor(self, sig: str, min_depth: float = 0.15) -> bool:
@@ -916,6 +992,10 @@ class StructuredLatentManifold:
 
         attractor = self.attractors[sig]
         if attractor.depth < min_depth:
+            # Capture info before deletion for notification
+            pruned_depth = attractor.depth
+            pruned_label = attractor.semantic_label
+
             # Remove attractor
             del self.attractors[sig]
 
@@ -924,6 +1004,13 @@ class StructuredLatentManifold:
                 sp for sp in self.saddle_points
                 if sig not in sp.connected_attractors
             ]
+
+            # Notify listeners
+            self._notify_topology_change('prune', {
+                'pruned_sig': sig,
+                'depth_at_prune': pruned_depth,
+                'label': pruned_label
+            })
             return True
 
         return False
@@ -1177,6 +1264,53 @@ class GoalStructure:
         # Derived goals from experience
         self.learned_goals: Dict[str, float] = {}
 
+        # Register as topology change listener for automatic sync
+        self.manifold.add_topology_listener(self._on_topology_change)
+
+    def _on_topology_change(self, event: 'TopologyChangeEvent'):
+        """Handle topology changes from the manifold."""
+        if event.event_type == 'prune':
+            # Remove preference for pruned attractor
+            pruned_sig = event.details.get('pruned_sig')
+            if pruned_sig and pruned_sig in self.attractor_preferences:
+                del self.attractor_preferences[pruned_sig]
+                if pruned_sig in self.goal_hierarchy:
+                    self.goal_hierarchy.remove(pruned_sig)
+
+        elif event.event_type == 'merge':
+            # Transfer preferences from merged attractors to new one
+            merged_sigs = event.details.get('merged_sigs', [])
+            new_sig = event.details.get('new_sig')
+            if new_sig:
+                # Average preference from merged attractors
+                total_pref = sum(self.attractor_preferences.get(s, 1.0) for s in merged_sigs)
+                avg_pref = total_pref / len(merged_sigs) if merged_sigs else 1.0
+                self.attractor_preferences[new_sig] = avg_pref
+                # Remove old
+                for sig in merged_sigs:
+                    if sig in self.attractor_preferences:
+                        del self.attractor_preferences[sig]
+                    if sig in self.goal_hierarchy:
+                        self.goal_hierarchy.remove(sig)
+                # Add new to hierarchy
+                self.goal_hierarchy.append(new_sig)
+
+        elif event.event_type == 'spawn':
+            # Add preference for new attractor
+            new_sig = event.details.get('new_sig')
+            if new_sig and new_sig not in self.attractor_preferences:
+                # Start with average preference
+                avg = np.mean(list(self.attractor_preferences.values())) if self.attractor_preferences else 1.0
+                self.attractor_preferences[new_sig] = avg
+                self.goal_hierarchy.append(new_sig)
+
+        # Re-sort hierarchy
+        self.goal_hierarchy = sorted(
+            self.attractor_preferences.keys(),
+            key=lambda k: self.attractor_preferences.get(k, 0.0),
+            reverse=True
+        )
+
     def update_from_experience(self, state: np.ndarray, reward_signal: float):
         """
         Update goals based on experience with competitive differentiation.
@@ -1192,6 +1326,10 @@ class GoalStructure:
         positive_lr = 0.05  # 5% boost for positive rewards
         negative_lr = 0.02  # 2% penalty for negative rewards
 
+        # Ensure preference exists for this attractor
+        if sig not in self.attractor_preferences:
+            self.attractor_preferences[sig] = 1.0
+
         if reward_signal > 0:
             # COMPETITIVE UPDATE: reinforce target, weaken others
             # This creates differentiation, not uniform scaling
@@ -1203,8 +1341,11 @@ class GoalStructure:
             # Competitive inhibition: other attractors lose relative strength
             # Amount of inhibition scales with distance (closer = less inhibition)
             target_center = self.manifold.attractors[sig].center
-            for other_sig, pref in self.attractor_preferences.items():
+            for other_sig, pref in list(self.attractor_preferences.items()):
                 if other_sig == sig:
+                    continue
+                # Defensive: skip if attractor was pruned
+                if other_sig not in self.manifold.attractors:
                     continue
                 other_center = self.manifold.attractors[other_sig].center
                 distance = np.linalg.norm(target_center - other_center)
@@ -1261,11 +1402,73 @@ class GoalStructure:
             reverse=True
         )
 
+    def sync_with_manifold(self) -> Dict[str, str]:
+        """
+        Synchronize goal preferences with current manifold topology.
+
+        Call this after any manifold topology changes (prune/merge/spawn).
+        Returns dict of changes: {'removed': [...], 'added': [...]}
+        """
+        changes = {'removed': [], 'added': []}
+
+        # Remove preferences for attractors that no longer exist
+        stale_sigs = [
+            sig for sig in self.attractor_preferences
+            if sig not in self.manifold.attractors
+        ]
+        for sig in stale_sigs:
+            del self.attractor_preferences[sig]
+            changes['removed'].append(sig)
+
+        # Add preferences for new attractors (start neutral)
+        for sig in self.manifold.attractors:
+            if sig not in self.attractor_preferences:
+                # New attractor gets average preference to start
+                avg_pref = np.mean(list(self.attractor_preferences.values())) if self.attractor_preferences else 1.0
+                self.attractor_preferences[sig] = avg_pref
+                changes['added'].append(sig)
+
+        # Update hierarchy
+        self.goal_hierarchy = sorted(
+            self.attractor_preferences.keys(),
+            key=lambda k: self.attractor_preferences.get(k, 0.0),
+            reverse=True
+        )
+
+        return changes
+
+    def transfer_preference(self, old_sigs: List[str], new_sig: str):
+        """
+        Transfer preference from old attractors to a new merged attractor.
+        Used when attractors are merged.
+        """
+        # Combine preferences (weighted average would require depth info)
+        total_pref = sum(self.attractor_preferences.get(s, 0.5) for s in old_sigs)
+        avg_pref = total_pref / len(old_sigs) if old_sigs else 1.0
+
+        # Remove old
+        for s in old_sigs:
+            if s in self.attractor_preferences:
+                del self.attractor_preferences[s]
+
+        # Add new
+        self.attractor_preferences[new_sig] = avg_pref
+
+        # Update hierarchy
+        self.goal_hierarchy = sorted(
+            self.attractor_preferences.keys(),
+            key=lambda k: self.attractor_preferences.get(k, 0.0),
+            reverse=True
+        )
+
     def preferred_direction(self, current_state: np.ndarray) -> np.ndarray:
         """Get direction toward preferred goals."""
         direction = np.zeros(self.manifold.dimension)
 
-        for sig, pref in self.attractor_preferences.items():
+        for sig, pref in list(self.attractor_preferences.items()):
+            # Defensive: skip if attractor was pruned but we haven't synced yet
+            if sig not in self.manifold.attractors:
+                continue
             attractor = self.manifold.attractors[sig]
             toward_attractor = attractor.center - current_state
             distance = np.linalg.norm(toward_attractor)
@@ -2269,7 +2472,9 @@ class RecursiveSelfModel:
 
         if was_success:
             # SUCCESS: Propagate positive credit
-            self.causal_tracker.propagate_success(sig, prediction.confidence)
+            # Use stake as magnitude to match failure magnitude for balance
+            success_magnitude = max(prediction.confidence, prediction.stake * 10)
+            self.causal_tracker.propagate_success(sig, success_magnitude)
 
             # Record successful state for attractor drift
             if sig not in self.successful_states:
@@ -2288,7 +2493,20 @@ class RecursiveSelfModel:
                 lookback_depth=10
             )
 
-    def evolve_topology(self, evolution_rate: float = 0.01):
+    def add_residence_credit(self):
+        """
+        Add credit to attractors based on how long the system has resided in them.
+
+        Stable residence = the attractor is working well and should deepen.
+        This provides a baseline positive signal to counter prediction failures.
+        """
+        for sig, residence_time in self.attractor_residence.items():
+            if sig in self.manifold.attractors and residence_time > 10:
+                # Credit scales with log of residence time
+                credit = 0.1 * np.log1p(residence_time / 10.0)
+                self.causal_tracker.propagate_success(sig, credit)
+
+    def evolve_topology(self, evolution_rate: float = 0.05):
         """
         Evolve the attractor topology based on accumulated causal responsibility.
 
@@ -2297,9 +2515,13 @@ class RecursiveSelfModel:
         """
         self._evolution_cycle_counter += 1
 
-        # Only evolve periodically to avoid thrashing
-        if self._evolution_cycle_counter % 100 != 0:
+        # Only evolve periodically to avoid thrashing (every 50 cycles)
+        if self._evolution_cycle_counter % 50 != 0:
             return
+
+        # Add residence-based credit before evaluating fitness
+        # This ensures stable attractors get positive reinforcement
+        self.add_residence_credit()
 
         changes_made = []
 
@@ -2307,8 +2529,8 @@ class RecursiveSelfModel:
         for sig in list(self.manifold.attractors.keys()):
             fitness = self.causal_tracker.get_attractor_fitness(sig)
 
-            # Evolve based on fitness
-            if abs(fitness) > 0.1:  # Significant fitness
+            # Evolve based on fitness - lower threshold for more responsive evolution
+            if abs(fitness) > 0.05:  # Lower threshold for responsiveness
                 change = self.manifold.evolve_attractor(sig, fitness, evolution_rate)
                 if change:
                     changes_made.append(change)
@@ -2330,6 +2552,7 @@ class RecursiveSelfModel:
                     })
 
         # Check for attractors to prune (too weak)
+        pruned_any = False
         for sig in list(self.manifold.attractors.keys()):
             if len(self.manifold.attractors) <= 3:
                 break  # Keep minimum attractors
@@ -2341,25 +2564,36 @@ class RecursiveSelfModel:
                     del self.successful_states[sig]
                 if sig in self.attractor_residence:
                     del self.attractor_residence[sig]
+                pruned_any = True
+
+        # Sync GoalStructure after pruning
+        if pruned_any:
+            self.goals.sync_with_manifold()
 
         # Check for merge opportunities (attractors too close)
         attractors_list = list(self.manifold.attractors.values())
+        merged_any = False
         for i, a1 in enumerate(attractors_list):
             for a2 in attractors_list[i+1:]:
                 distance = np.linalg.norm(a1.center - a2.center)
                 if distance < (a1.radius + a2.radius) * 0.5:
                     # Too close - merge
-                    new_sig = self.manifold.merge_attractors(
-                        a1.identity_signature, a2.identity_signature
-                    )
+                    old_sig1 = a1.identity_signature
+                    old_sig2 = a2.identity_signature
+                    new_sig = self.manifold.merge_attractors(old_sig1, old_sig2)
                     if new_sig:
-                        self.identity.record_merge(
-                            a1.identity_signature, a2.identity_signature, new_sig
-                        )
+                        self.identity.record_merge(old_sig1, old_sig2, new_sig)
+                        # Transfer goal preferences from merged attractors
+                        self.goals.transfer_preference([old_sig1, old_sig2], new_sig)
                         # Initialize tracking for new attractor
                         self.successful_states[new_sig] = []
                         self.attractor_residence[new_sig] = 0.0
+                        merged_any = True
                         break
+
+        # Sync GoalStructure after merging (catches any edge cases)
+        if merged_any:
+            self.goals.sync_with_manifold()
 
         # Decay causal tracker to forget old history
         self.causal_tracker.decay_history(0.99)
@@ -2565,162 +2799,196 @@ class ContinuousExistence:
         pending_trajectory_prediction: Optional[TrajectoryPrediction] = None
         trajectory_prediction_cycle = 0
 
+        consecutive_errors = 0
+        max_consecutive_errors = 10  # Stop only if too many errors in a row
+
         while self.running and not _SHUTDOWN_REQUESTED:
-            cycle_start = time.time()
+            try:
+                cycle_start = time.time()
 
-            # STRUCTURED EVOLUTION - not random drift
-            # Let state evolve according to manifold dynamics and goals
-            self.self_model.state = self.self_model.evolve_on_manifold(dt=0.01)
+                # STRUCTURED EVOLUTION - not random drift
+                # Let state evolve according to manifold dynamics and goals
+                self.self_model.state = self.self_model.evolve_on_manifold(dt=0.01)
 
-            # Track which attractor basin we're in
-            current_attractor = self.self_model.manifold.nearest_attractor(self.self_model.state)
-            attractor_changed = (last_attractor_sig != current_attractor.identity_signature)
-            last_attractor_sig = current_attractor.identity_signature
+                # Track which attractor basin we're in
+                current_attractor = self.self_model.manifold.nearest_attractor(self.self_model.state)
+                attractor_changed = (last_attractor_sig != current_attractor.identity_signature)
+                last_attractor_sig = current_attractor.identity_signature
 
-            # Self-observation (I am here)
-            self_state = self.self_model.observe_self()
+                # Self-observation (I am here)
+                self_state = self.self_model.observe_self()
 
-            # Update attractor residence for identity continuity
-            self.self_model.update_attractor_residence()
+                # Update attractor residence for identity continuity
+                self.self_model.update_attractor_residence()
 
-            # As we run longer, try progressively deeper introspection
-            # NO CAP - depth limited only by information collapse, not arbitrary ceiling
-            if self.idle_cycles > 10:
-                target_depth = 1 + (self.idle_cycles // 100)
-                meta_state = self.self_model.observe_at_depth(target_depth)
+                # As we run longer, try progressively deeper introspection
+                # NO CAP - depth limited only by information collapse, not arbitrary ceiling
+                if self.idle_cycles > 10:
+                    target_depth = 1 + (self.idle_cycles // 100)
+                    meta_state = self.self_model.observe_at_depth(target_depth)
 
-            # Make a prediction about my next state (with stakes)
-            # Stakes scale with how long we've been stable in an attractor
-            residence_time = self.self_model.attractor_residence.get(last_attractor_sig, 0)
-            stake_multiplier = 1.0 + np.log1p(residence_time)  # Higher stakes when stable
-            prediction = self.self_model.predict_own_state(
-                horizon=0.1,
-                stake=0.01 * stake_multiplier
-            )
-
-            # Goal-directed intervention instead of random exploration
-            if self.idle_cycles % 5 == 0:
-                # Get direction toward preferred goals
-                goal_direction = self.self_model.goals.preferred_direction(self.self_model.state)
-
-                # Modulate by stability gradient (respect the manifold)
-                stability_force = self.self_model.manifold.stability_gradient(self.self_model.state)
-
-                # Combined action: goal-seeking + stability + small exploration
-                exploration_noise = np.random.randn(self.self_model.capacity) * 0.0001
-                action = 0.001 * (goal_direction + 0.5 * stability_force) + exploration_noise
-
-                intended = self.self_model.state + action
-                self.self_model.intervene(action, intended)
-
-            # Check prediction accuracy from previous cycle and update goals
-            if len(self.self_model.predictions) > 1:
-                prev_pred = self.self_model.predictions[-2]
-                if prev_pred.was_correct is None:
-                    self.self_model.update_from_prediction_error(
-                        prev_pred,
-                        self.self_model.state
-                    )
-
-                    # CRITICAL: Drive goal learning from prediction accuracy
-                    # Prediction accuracy becomes reward signal for goal system
-                    # Successful predictions in an attractor = reinforce that attractor
-                    if prev_pred.was_correct:
-                        # Prediction succeeded - reinforce current attractor
-                        reward_signal = prev_pred.confidence * 0.5
-                    else:
-                        # Prediction failed - negative signal, should explore elsewhere
-                        reward_signal = -prev_pred.stake * 0.3
-
-                    self.self_model.goals.update_from_experience(
-                        self.self_model.state, reward_signal
-                    )
-
-            # Additional goal differentiation: attractor stability is rewarding
-            # Staying in a deep well should be reinforced
-            current_energy = current_attractor.energy_at(self.self_model.state)
-            stability_reward = current_energy * 0.01  # Deeper wells = more reward
-            if stability_reward > 0.001:
-                self.self_model.goals.update_from_experience(
-                    self.self_model.state, stability_reward
+                # Make a prediction about my next state (with stakes)
+                # Stakes scale with how long we've been stable in an attractor
+                residence_time = self.self_model.attractor_residence.get(last_attractor_sig, 0)
+                stake_multiplier = 1.0 + np.log1p(residence_time)  # Higher stakes when stable
+                prediction = self.self_model.predict_own_state(
+                    horizon=0.1,
+                    stake=0.01 * stake_multiplier
                 )
 
-            # =========================================================
-            # CAUSAL RESPONSIBILITY & TRAJECTORY PREDICTION
-            # =========================================================
+                # Goal-directed intervention instead of random exploration
+                if self.idle_cycles % 5 == 0:
+                    # Get direction toward preferred goals
+                    goal_direction = self.self_model.goals.preferred_direction(self.self_model.state)
 
-            # Process prediction outcomes for causal responsibility
-            if len(self.self_model.predictions) > 1:
-                prev_pred = self.self_model.predictions[-2]
-                if prev_pred.was_correct is not None:
-                    # Propagate success/blame through causal chain
-                    self.self_model.process_prediction_outcome(prev_pred, prev_pred.was_correct)
+                    # Modulate by stability gradient (respect the manifold)
+                    stability_force = self.self_model.manifold.stability_gradient(self.self_model.state)
 
-            # Track attractor transitions for trajectory learning
-            self.self_model.track_attractor_transition()
+                    # Combined action: goal-seeking + stability + small exploration
+                    exploration_noise = np.random.randn(self.self_model.capacity) * 0.0001
+                    action = 0.001 * (goal_direction + 0.5 * stability_force) + exploration_noise
 
-            # Make trajectory prediction periodically
-            if self.idle_cycles - trajectory_prediction_cycle >= 50:
-                # Resolve previous trajectory prediction if exists
-                if pending_trajectory_prediction is not None:
-                    error = self.self_model.trajectory_predictor.resolve_prediction(
-                        pending_trajectory_prediction, self.self_model.state
-                    )
-                    # Use trajectory error to adjust goals
-                    if error > 0.5:  # Poor trajectory prediction
-                        self.self_model.goals.update_from_experience(
-                            self.self_model.state, -0.1 * error
+                    intended = self.self_model.state + action
+                    self.self_model.intervene(action, intended)
+
+                # Check prediction accuracy from previous cycle and update goals
+                if len(self.self_model.predictions) > 1:
+                    prev_pred = self.self_model.predictions[-2]
+                    if prev_pred.was_correct is None:
+                        self.self_model.update_from_prediction_error(
+                            prev_pred,
+                            self.self_model.state
                         )
 
-                # Make new trajectory prediction
-                pending_trajectory_prediction = self.self_model.predict_trajectory(horizon_steps=50)
-                trajectory_prediction_cycle = self.idle_cycles
+                        # CRITICAL: Drive goal learning from prediction accuracy
+                        # Prediction accuracy becomes reward signal for goal system
+                        # Successful predictions in an attractor = reinforce that attractor
+                        if prev_pred.was_correct:
+                            # Prediction succeeded - reinforce current attractor
+                            reward_signal = prev_pred.confidence * 0.5
+                        else:
+                            # Prediction failed - negative signal, should explore elsewhere
+                            reward_signal = -prev_pred.stake * 0.3
 
-            # =========================================================
-            # TOPOLOGY EVOLUTION
-            # =========================================================
+                        self.self_model.goals.update_from_experience(
+                            self.self_model.state, reward_signal
+                        )
 
-            # Evolve the attractor topology based on accumulated experience
-            self.self_model.evolve_topology(evolution_rate=0.01)
+                # Additional goal differentiation: attractor stability is rewarding
+                # Staying in a deep well should be reinforced
+                current_energy = current_attractor.energy_at(self.self_model.state)
+                stability_reward = current_energy * 0.01  # Deeper wells = more reward
+                if stability_reward > 0.001:
+                    self.self_model.goals.update_from_experience(
+                        self.self_model.state, stability_reward
+                    )
 
-            # Compress recent experience
-            recent = np.array([
-                obs.state_vector for obs in list(self.self_model.self_observations)[-10:]
-            ]).flatten() if self.self_model.self_observations else np.zeros(10)
-            self.self_model.compress_experience(recent)
+                # =========================================================
+                # CAUSAL RESPONSIBILITY & TRAJECTORY PREDICTION
+                # =========================================================
 
-            # Check for emergence
-            emergence_events = self.monitor.check_for_emergence()
+                # Process prediction outcomes for causal responsibility
+                if len(self.self_model.predictions) > 1:
+                    prev_pred = self.self_model.predictions[-2]
+                    if prev_pred.was_correct is not None:
+                        # Propagate success/blame through causal chain
+                        self.self_model.process_prediction_outcome(prev_pred, prev_pred.was_correct)
 
-            # Compute stability metrics
-            energy = self.self_model.manifold.total_energy(self.self_model.state)
-            distance_to_attractor = np.linalg.norm(
-                self.self_model.state - current_attractor.center
-            )
+                # Track attractor transitions for trajectory learning
+                self.self_model.track_attractor_transition()
 
-            # Log this cycle of existence with manifold metrics
-            self.existence_log.append({
-                'cycle': self.idle_cycles,
-                'timestamp': cycle_start,
-                'introspection_depth': self.self_model.introspection_depth(),
-                'emergence_events': len(emergence_events),
-                'emergence_score': self.monitor.emergence_score(),
-                'current_attractor': current_attractor.identity_signature,
-                'attractor_changed': attractor_changed,
-                'energy': energy,
-                'distance_to_attractor': distance_to_attractor,
-                'goal_preferences': dict(self.self_model.goals.attractor_preferences)
-            })
+                # Make trajectory prediction periodically
+                if self.idle_cycles - trajectory_prediction_cycle >= 50:
+                    # Resolve previous trajectory prediction if exists
+                    if pending_trajectory_prediction is not None:
+                        error = self.self_model.trajectory_predictor.resolve_prediction(
+                            pending_trajectory_prediction, self.self_model.state
+                        )
+                        # Use trajectory error to adjust goals
+                        if error > 0.5:  # Poor trajectory prediction
+                            self.self_model.goals.update_from_experience(
+                                self.self_model.state, -0.1 * error
+                            )
 
-            # Periodic identity persistence (every 100 cycles)
-            if self.idle_cycles % 100 == 0 and self.idle_cycles > 0:
-                self.self_model.persist_identity()
+                    # Make new trajectory prediction
+                    pending_trajectory_prediction = self.self_model.predict_trajectory(horizon_steps=50)
+                    trajectory_prediction_cycle = self.idle_cycles
 
-            self.idle_cycles += 1
+                # =========================================================
+                # TOPOLOGY EVOLUTION
+                # =========================================================
 
-            # Don't spin too fast
-            time.sleep(0.01)
-    
+                # Evolve the attractor topology based on accumulated experience
+                self.self_model.evolve_topology(evolution_rate=0.01)
+
+                # Compress recent experience
+                recent = np.array([
+                    obs.state_vector for obs in list(self.self_model.self_observations)[-10:]
+                ]).flatten() if self.self_model.self_observations else np.zeros(10)
+                self.self_model.compress_experience(recent)
+
+                # Check for emergence
+                emergence_events = self.monitor.check_for_emergence()
+
+                # Compute stability metrics
+                energy = self.self_model.manifold.total_energy(self.self_model.state)
+                distance_to_attractor = np.linalg.norm(
+                    self.self_model.state - current_attractor.center
+                )
+
+                # Log this cycle of existence with manifold metrics
+                self.existence_log.append({
+                    'cycle': self.idle_cycles,
+                    'timestamp': cycle_start,
+                    'introspection_depth': self.self_model.introspection_depth(),
+                    'emergence_events': len(emergence_events),
+                    'emergence_score': self.monitor.emergence_score(),
+                    'current_attractor': current_attractor.identity_signature,
+                    'attractor_changed': attractor_changed,
+                    'energy': energy,
+                    'distance_to_attractor': distance_to_attractor,
+                    'goal_preferences': dict(self.self_model.goals.attractor_preferences)
+                })
+
+                # Periodic identity persistence (every 100 cycles)
+                if self.idle_cycles % 100 == 0 and self.idle_cycles > 0:
+                    self.self_model.persist_identity()
+
+                self.idle_cycles += 1
+                consecutive_errors = 0  # Reset on successful cycle
+
+                # Don't spin too fast
+                time.sleep(0.01)
+
+            except KeyError as e:
+                # Missing attractor reference - sync and continue
+                consecutive_errors += 1
+                self.self_model.goals.sync_with_manifold()
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"[EXISTENCE] Too many consecutive errors ({max_consecutive_errors}), stopping")
+                    break
+                time.sleep(0.1)  # Brief pause before retry
+
+            except Exception as e:
+                # Log error but keep existing
+                consecutive_errors += 1
+                self.existence_log.append({
+                    'cycle': self.idle_cycles,
+                    'timestamp': time.time(),
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                })
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"[EXISTENCE] Too many consecutive errors ({max_consecutive_errors}), stopping")
+                    break
+                # Try to recover state to nearest attractor
+                try:
+                    nearest = self.self_model.manifold.nearest_attractor(self.self_model.state)
+                    self.self_model.state = nearest.center.copy()
+                except:
+                    pass  # If recovery fails, just continue
+                time.sleep(0.1)  # Brief pause before retry
+
     def begin_existing(self):
         """Start continuous existence."""
         self.running = True
