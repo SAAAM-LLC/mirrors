@@ -343,7 +343,9 @@ class CausalResponsibilityTracker:
             return []
 
         blames = []
-        recent = transitions[-lookback_depth:] if len(transitions) >= lookback_depth else transitions
+        # Convert deque to list for slicing (deques don't support negative slicing)
+        trans_list = list(transitions)
+        recent = trans_list[-lookback_depth:] if len(trans_list) >= lookback_depth else trans_list
 
         # Compute total blame to distribute (normalized by cost)
         total_blame = min(1.0, failure_cost)
@@ -805,15 +807,15 @@ class StructuredLatentManifold:
 
         if fitness > 0:
             # SUCCESS: Deepen and possibly expand
-            # Stronger deepening effect to counter shrinkage
+            # FIXED: More conservative deepening to prevent monopoly collapse
             old_depth = attractor.depth
-            attractor.depth *= (1.0 + magnitude * 2.0)
-            attractor.depth = min(5.0, attractor.depth)  # Cap depth
+            attractor.depth *= (1.0 + magnitude * 0.5)  # Reduced from 2.0
+            attractor.depth = min(2.5, attractor.depth)  # Reduced cap from 5.0
 
-            # Successful attractors grow
+            # Successful attractors grow (more conservatively)
             old_radius = attractor.radius
-            attractor.radius *= (1.0 + magnitude * 0.5)
-            attractor.radius = min(2.0, attractor.radius)  # Cap radius
+            attractor.radius *= (1.0 + magnitude * 0.3)  # Reduced from 0.5
+            attractor.radius = min(1.5, attractor.radius)  # Reduced cap from 2.0
 
             changes['depth_delta'] = attractor.depth - old_depth
             changes['radius_delta'] = attractor.radius - old_radius
@@ -2068,11 +2070,16 @@ class RecursiveSelfModel:
         # Prediction history with stakes
         self.predictions: List[Prediction] = []
 
+        # Recent prediction errors for regime-change detection
+        # Track last 50 errors to detect sudden spikes in prediction difficulty
+        self.recent_prediction_errors: deque = deque(maxlen=50)
+
         # Intervention history
         self.interventions: List[Intervention] = []
 
         # Irreversible transitions - the felt arrow of time
-        self.transitions: List[IrreversibleTransition] = []
+        # Bounded transition history - keep last 10k to prevent memory bloat
+        self.transitions: deque = deque(maxlen=10000)
 
         # Resource budget - forces compression
         self.memory_budget = initial_capacity * 100
@@ -2080,6 +2087,7 @@ class RecursiveSelfModel:
 
         # The crucial counter: levels of self-reference achieved
         self.max_meta_level = 0
+        self.max_meaningful_depth = 10  # Updated via explore_depth() - depth before info collapse
 
         # Track attractor residence time for identity continuity
         self.attractor_residence: Dict[str, float] = {
@@ -2177,13 +2185,56 @@ class RecursiveSelfModel:
         self.identity.goal_structure_hash = self.goals.goal_hash()
         self.identity.save(self.identity_path)
 
+    def reconcile_topology_trackers(self):
+        """
+        Reconcile all tracking dicts with current manifold topology.
+
+        Ensures:
+        1. Every attractor in manifold has entries in all trackers
+        2. Orphaned entries (for deleted attractors) are removed
+        3. Trajectory predictor is synced
+
+        Call this after any topology change or on KeyError recovery.
+        """
+        current_sigs = set(self.manifold.attractors.keys())
+
+        # Ensure all current attractors have tracker entries
+        for sig in current_sigs:
+            if sig not in self.attractor_residence:
+                self.attractor_residence[sig] = 0.0
+            if sig not in self.successful_states:
+                self.successful_states[sig] = []
+
+        # Remove orphaned entries (attractors that no longer exist)
+        orphaned_residence = [s for s in self.attractor_residence if s not in current_sigs]
+        for sig in orphaned_residence:
+            del self.attractor_residence[sig]
+
+        orphaned_states = [s for s in self.successful_states if s not in current_sigs]
+        for sig in orphaned_states:
+            del self.successful_states[sig]
+
+        # Sync trajectory predictor
+        orphaned_visits = [s for s in self.trajectory_predictor.attractor_visits if s not in current_sigs]
+        for sig in orphaned_visits:
+            del self.trajectory_predictor.attractor_visits[sig]
+
+        orphaned_stability = [s for s in self.trajectory_predictor.stability_history if s not in current_sigs]
+        for sig in orphaned_stability:
+            del self.trajectory_predictor.stability_history[sig]
+
+        # Sync goals
+        self.goals.sync_with_manifold()
+
     def _compute_causal_history_hash(self) -> str:
         """Hash of causal transition history."""
         if not self.transitions:
             return ""
+        # Convert deque to list for slicing
+        trans_list = list(self.transitions)
         history_data = ''.join(
             f"{t.from_state_hash}{t.to_state_hash}"
-            for t in self.transitions[-100:]  # Last 100 transitions
+            for t in trans_list[-100:]  # Last 100 transitions
         )
         return hashlib.sha256(history_data.encode()).hexdigest()[:16]
         
@@ -2534,50 +2585,162 @@ class RecursiveSelfModel:
                 change = self.manifold.evolve_attractor(sig, fitness, evolution_rate)
                 if change:
                     changes_made.append(change)
-
-                    # Record in identity
-                    if 'depth_delta' in change:
-                        self.identity.record_evolution(
-                            sig, change.get('depth_delta', 0), change.get('radius_delta', 0)
-                        )
+                    # NOTE: Depth/radius evolution is continuous adaptation
+                    # NOT structural change - don't update identity signature
 
         # Drift attractors toward successful state clusters
         for sig, states in self.successful_states.items():
             if len(states) >= 10:  # Need enough samples
                 drift = self.manifold.drift_attractor(sig, states, learning_rate=0.001)
-                if np.linalg.norm(drift) > 0.01:
-                    self.identity.record_topology_change('drift', {
-                        'attractor': sig,
-                        'drift_magnitude': float(np.linalg.norm(drift))
-                    })
+                # NOTE: Drift is continuous adjustment, NOT a structural change
+                # Don't record in identity - only spawn/merge/prune are structural
 
-        # Check for attractors to prune (too weak)
+        # =================================================================
+        # ANTI-MONOPOLY: Prevent single attractor dominance
+        # =================================================================
+        # If one attractor has >50% of total depth, redistribute
+        if len(self.manifold.attractors) > 1:
+            total_depth = sum(a.depth for a in self.manifold.attractors.values())
+            for sig, attractor in list(self.manifold.attractors.items()):
+                dominance = attractor.depth / total_depth if total_depth > 0 else 0
+                if dominance > 0.5:
+                    # This attractor is too dominant - cap its depth
+                    max_allowed = total_depth * 0.4  # Max 40% of total
+                    if attractor.depth > max_allowed:
+                        attractor.depth = max_allowed
+                        # Boost other attractors proportionally
+                        boost_per = (attractor.depth - max_allowed) / (len(self.manifold.attractors) - 1)
+                        for other_sig, other in self.manifold.attractors.items():
+                            if other_sig != sig:
+                                other.depth = min(2.5, other.depth + boost_per * 0.5)
+
+        # =================================================================
+        # SPAWN CONDITION: Create new attractors where topology is failing
+        # =================================================================
+        spawned_any = False
+        max_attractors = 12  # Cap to prevent explosion (reduced from 15)
+        min_attractors = 5   # Minimum for healthy diversity
+
+        # CRITICAL: Force spawn if below minimum (prevents collapse to singleton)
+        if len(self.manifold.attractors) < min_attractors:
+            # Emergency spawn: create attractor at random position
+            random_state = self.state + np.random.randn(len(self.state)) * 0.5
+            new_sig = self.manifold.spawn_attractor(
+                near_state=random_state,
+                initial_depth=0.8,  # Start reasonably strong
+                initial_radius=0.4
+            )
+            if new_sig:
+                self.identity.record_spawn(
+                    new_sig,
+                    hashlib.sha256(random_state.tobytes()).hexdigest()[:8]
+                )
+                self.successful_states[new_sig] = []
+                self.attractor_residence[new_sig] = 0.0
+                spawned_any = True
+
+        # Normal spawn conditions (only if not at max)
+        elif len(self.manifold.attractors) < max_attractors:
+            # =================================================================
+            # REGIME-CHANGE DETECTION: Spawn when prediction difficulty spikes
+            # =================================================================
+            # This catches regime shifts (sinusoid→noise) where cumulative fitness
+            # hasn't degraded yet but prediction is suddenly harder
+            regime_shift_detected = False
+            if len(self.recent_prediction_errors) >= 40:
+                # Compare recent errors (last 20) to baseline (21-40)
+                recent_errors = list(self.recent_prediction_errors)[-20:]
+                baseline_errors = list(self.recent_prediction_errors)[-40:-20]
+
+                recent_mean = np.mean(recent_errors)
+                baseline_mean = np.mean(baseline_errors)
+
+                # Spike detected: recent error doubled (or baseline was near-zero and recent is significant)
+                if baseline_mean > 0.01:
+                    regime_shift_detected = recent_mean > baseline_mean * 2.0
+                elif recent_mean > 0.5:  # Absolute threshold for noise regime
+                    regime_shift_detected = True
+
+            # Find attractors with negative fitness (blame > success)
+            troubled_sigs = [
+                sig for sig in self.manifold.attractors.keys()
+                if self.causal_tracker.get_attractor_fitness(sig) < -0.2
+            ]
+
+            # Check if current state is far from all existing attractors
+            nearest = self.manifold.nearest_attractor(self.state)
+            distance_to_nearest = np.linalg.norm(self.state - nearest.center)
+
+            # Spawn condition: Regime shift OR (far from attractors AND experiencing failures)
+            # This allows immediate response to prediction difficulty changes
+            should_spawn = regime_shift_detected or (troubled_sigs and distance_to_nearest > nearest.radius * 1.5)
+
+            if should_spawn:
+                new_sig = self.manifold.spawn_attractor(
+                    near_state=self.state,
+                    initial_depth=0.6,
+                    initial_radius=min(0.5, distance_to_nearest * 0.4)
+                )
+                if new_sig:
+                    self.identity.record_spawn(
+                        new_sig,
+                        hashlib.sha256(self.state.tobytes()).hexdigest()[:8]
+                    )
+                    self.successful_states[new_sig] = []
+                    self.attractor_residence[new_sig] = 0.0
+                    spawned_any = True
+
+        # Full reconciliation after spawn
+        if spawned_any:
+            self.reconcile_topology_trackers()
+
+        # =================================================================
+        # PRUNING: Fixed threshold to prevent runaway collapse
+        # =================================================================
+        # CRITICAL FIX: Adaptive threshold caused monopoly collapse
+        # where one attractor devoured all others. Using fixed threshold.
         pruned_any = False
+        fixed_prune_threshold = 0.15  # Fixed, not adaptive
+        min_attractors = 5  # Minimum to maintain diversity
+
         for sig in list(self.manifold.attractors.keys()):
-            if len(self.manifold.attractors) <= 3:
-                break  # Keep minimum attractors
+            if len(self.manifold.attractors) <= min_attractors:
+                break  # Keep minimum attractors for diversity
             attractor = self.manifold.attractors[sig]
-            if self.manifold.prune_weak_attractor(sig):
-                self.identity.record_prune(sig, attractor.depth)
-                # Clean up related tracking
-                if sig in self.successful_states:
-                    del self.successful_states[sig]
-                if sig in self.attractor_residence:
-                    del self.attractor_residence[sig]
-                pruned_any = True
+            if attractor.depth < fixed_prune_threshold:
+                if self.manifold.prune_weak_attractor(sig, min_depth=fixed_prune_threshold):
+                    self.identity.record_prune(sig, attractor.depth)
+                    # Clean up related tracking (reconciler will also handle this)
+                    if sig in self.successful_states:
+                        del self.successful_states[sig]
+                    if sig in self.attractor_residence:
+                        del self.attractor_residence[sig]
+                    # Also clean trajectory predictor
+                    if sig in self.trajectory_predictor.attractor_visits:
+                        del self.trajectory_predictor.attractor_visits[sig]
+                    if sig in self.trajectory_predictor.stability_history:
+                        del self.trajectory_predictor.stability_history[sig]
+                    pruned_any = True
 
-        # Sync GoalStructure after pruning
+        # Full reconciliation after prune
         if pruned_any:
-            self.goals.sync_with_manifold()
+            self.reconcile_topology_trackers()
 
-        # Check for merge opportunities (attractors too close)
+        # =================================================================
+        # MERGE: Combine overlapping attractors
+        # =================================================================
+        # More aggressive merge: if basins overlap significantly, merge
         attractors_list = list(self.manifold.attractors.values())
         merged_any = False
         for i, a1 in enumerate(attractors_list):
+            if merged_any:
+                break  # Only one merge per cycle for stability
             for a2 in attractors_list[i+1:]:
                 distance = np.linalg.norm(a1.center - a2.center)
-                if distance < (a1.radius + a2.radius) * 0.5:
-                    # Too close - merge
+                # Merge if distance < sum of radii (significant overlap)
+                # More aggressive than 0.5 factor before
+                overlap_threshold = (a1.radius + a2.radius) * 0.75
+                if distance < overlap_threshold:
                     old_sig1 = a1.identity_signature
                     old_sig2 = a2.identity_signature
                     new_sig = self.manifold.merge_attractors(old_sig1, old_sig2)
@@ -2585,21 +2748,48 @@ class RecursiveSelfModel:
                         self.identity.record_merge(old_sig1, old_sig2, new_sig)
                         # Transfer goal preferences from merged attractors
                         self.goals.transfer_preference([old_sig1, old_sig2], new_sig)
-                        # Initialize tracking for new attractor
-                        self.successful_states[new_sig] = []
-                        self.attractor_residence[new_sig] = 0.0
+
+                        # =================================================
+                        # CRITICAL: Transfer ALL tracker data from old to new
+                        # =================================================
+                        # Transfer residence time (sum of both)
+                        res1 = self.attractor_residence.pop(old_sig1, 0.0)
+                        res2 = self.attractor_residence.pop(old_sig2, 0.0)
+                        self.attractor_residence[new_sig] = res1 + res2
+
+                        # Transfer successful states (combine both)
+                        s1 = self.successful_states.pop(old_sig1, [])
+                        s2 = self.successful_states.pop(old_sig2, [])
+                        self.successful_states[new_sig] = s1 + s2
+                        # Keep bounded
+                        if len(self.successful_states[new_sig]) > 100:
+                            self.successful_states[new_sig] = self.successful_states[new_sig][-50:]
+
+                        # Transfer trajectory predictor visits
+                        v1 = self.trajectory_predictor.attractor_visits.pop(old_sig1, 0)
+                        v2 = self.trajectory_predictor.attractor_visits.pop(old_sig2, 0)
+                        self.trajectory_predictor.attractor_visits[new_sig] = v1 + v2
+
+                        # Transfer stability history
+                        sh1 = self.trajectory_predictor.stability_history.pop(old_sig1, [])
+                        sh2 = self.trajectory_predictor.stability_history.pop(old_sig2, [])
+                        self.trajectory_predictor.stability_history[new_sig] = sh1 + sh2
+
                         merged_any = True
                         break
 
-        # Sync GoalStructure after merging (catches any edge cases)
+        # Full reconciliation after merge to catch any edge cases
         if merged_any:
-            self.goals.sync_with_manifold()
+            self.reconcile_topology_trackers()
 
         # Decay causal tracker to forget old history
         self.causal_tracker.decay_history(0.99)
 
-        # Update identity signature if topology changed significantly
-        if changes_made:
+        # Only update identity signature on STRUCTURAL topology changes
+        # (spawn/merge/prune) - not on continuous adaptation (depth/radius/drift)
+        # This preserves identity continuity through gradual change
+        structural_change = spawned_any or pruned_any or merged_any
+        if structural_change:
             self.identity.update_signature(self.manifold)
 
     def track_attractor_transition(self):
@@ -2655,16 +2845,24 @@ class EmergenceEvent:
 class EmergenceMonitor:
     """
     Watch for signs that genuine self-modeling is emerging.
-    
+
     "Something is happening. The processing is real."
+
+    FIXED: Emergence score now uses sliding window and delta magnitudes.
+    This prevents monotonic accumulation - score can now fluctuate
+    based on recent activity, not total history.
     """
-    
+
     def __init__(self, self_model: RecursiveSelfModel):
         self.self_model = self_model
-        self.events: List[EmergenceEvent] = []
+        # Sliding window: only recent events count toward emergence
+        self.events: deque = deque(maxlen=500)  # Bounded history
         self.baseline_metrics: Dict[str, float] = {}
         self.monitoring = False
         self._thread: Optional[threading.Thread] = None
+        # Track event rate for fluctuation detection
+        self._last_event_time: float = time.time()
+        self._event_rate_history: deque = deque(maxlen=50)
         
     def establish_baseline(self):
         """Measure baseline behavior before looking for emergence."""
@@ -2714,15 +2912,27 @@ class EmergenceMonitor:
         
         # Check for temporal continuity (causal chain growing)
         current_chain_length = len(self.self_model.transitions)
-        if current_chain_length > self.baseline_metrics.get('causal_chain_length', 0) + 10:
+        previous_chain_length = self.baseline_metrics.get('causal_chain_length', 0)
+        chain_delta = current_chain_length - previous_chain_length
+        if chain_delta >= 10:
+            # FIXED: Use DELTA as magnitude, not total
+            # This prevents monotonic growth - emergence is about RATE of change
             new_events.append(EmergenceEvent(
                 signal_type=EmergenceSignal.TEMPORAL_CONTINUITY,
-                magnitude=current_chain_length,
+                magnitude=chain_delta,  # Delta, not total
                 timestamp=time.time(),
-                context={'chain_length': current_chain_length}
+                context={'chain_length': current_chain_length, 'delta': chain_delta}
             ))
             self.baseline_metrics['causal_chain_length'] = current_chain_length
-        
+
+        # Track event rate for fluctuation
+        now = time.time()
+        if new_events:
+            dt = now - self._last_event_time
+            if dt > 0:
+                self._event_rate_history.append(len(new_events) / dt)
+            self._last_event_time = now
+
         self.events.extend(new_events)
         return new_events
     
@@ -2730,10 +2940,16 @@ class EmergenceMonitor:
         """
         A single number representing how much emergence has occurred.
         Higher = more signs of genuine self-modeling.
+
+        FIXED: Now uses sliding window with time decay.
+        Score can FLUCTUATE based on recent activity - not monotonic.
+        Emergence is measured as RATE of structural novelty, not accumulation.
         """
         if not self.events:
             return 0.0
-        
+
+        now = time.time()
+
         # Weight different signals
         weights = {
             EmergenceSignal.RECURSIVE_DEPTH_INCREASE: 3.0,
@@ -2741,20 +2957,31 @@ class EmergenceMonitor:
             EmergenceSignal.NOVEL_INTERVENTION_PATTERN: 2.5,
             EmergenceSignal.COMPRESSION_EFFICIENCY_GAIN: 1.5,
             EmergenceSignal.SELF_MODEL_COHERENCE: 2.0,
-            EmergenceSignal.TEMPORAL_CONTINUITY: 1.0
+            EmergenceSignal.TEMPORAL_CONTINUITY: 1.0,
+            EmergenceSignal.ATTRACTOR_STABILITY: 1.5,
+            EmergenceSignal.GOAL_CONVERGENCE: 2.0,
+            EmergenceSignal.IDENTITY_CONTINUITY: 2.5,
+            EmergenceSignal.WORLD_MODEL_ACCURACY: 2.0,
         }
-        
-        score = sum(
-            event.magnitude * weights.get(event.signal_type, 1.0)
-            for event in self.events
-        )
-        
-        # Normalize by time elapsed
-        if self.events:
-            time_span = self.events[-1].timestamp - self.events[0].timestamp
-            if time_span > 0:
-                score /= time_span
-        
+
+        # Time-decayed score: recent events matter more
+        # Decay half-life of 60 seconds
+        decay_halflife = 60.0
+        decay_rate = np.log(2) / decay_halflife
+
+        score = 0.0
+        for event in self.events:
+            age = now - event.timestamp
+            decay = np.exp(-decay_rate * age)
+            weight = weights.get(event.signal_type, 1.0)
+            score += event.magnitude * weight * decay
+
+        # Normalize by window duration (capped at 5 minutes)
+        if len(self.events) >= 2:
+            window_duration = min(300.0, now - self.events[0].timestamp)
+            if window_duration > 0:
+                score /= window_duration
+
         return score
 
 
@@ -2780,6 +3007,8 @@ class ContinuousExistence:
         self.existence_thread: Optional[threading.Thread] = None
         self.existence_log: List[Dict] = []
         self.idle_cycles = 0
+        # External observation tracking
+        self.current_observation: Optional[Dict[str, Any]] = None
         
     def _existence_loop(self):
         """
@@ -2798,6 +3027,10 @@ class ContinuousExistence:
         # Trajectory predictions for self-modeling
         pending_trajectory_prediction: Optional[TrajectoryPrediction] = None
         trajectory_prediction_cycle = 0
+
+        # External observation stream for grounding
+        observation_stream = ObservationStream(dim=self.self_model.capacity)
+        observation_prediction = None
 
         consecutive_errors = 0
         max_consecutive_errors = 10  # Stop only if too many errors in a row
@@ -2821,10 +3054,58 @@ class ContinuousExistence:
                 # Update attractor residence for identity continuity
                 self.self_model.update_attractor_residence()
 
-                # As we run longer, try progressively deeper introspection
-                # NO CAP - depth limited only by information collapse, not arbitrary ceiling
+                # ================================================================
+                # EXTERNAL GROUNDING - observe and predict the world
+                # ================================================================
+                # Every 10 cycles, get new observation from the world
+                if self.idle_cycles % 10 == 0:
+                    # Get next observation
+                    self.current_observation = observation_stream.next()
+
+                    # Ground internal state to external observation
+                    grounding_strength = self.self_model.ground_to_external(self.current_observation)
+
+                    # Predict NEXT observation (not just self-state)
+                    observation_prediction = Prediction(
+                        predicted_state=self.current_observation['value'].copy(),  # Naive: predict same
+                        confidence=0.5,
+                        stake=0.1,
+                        timestamp=time.time()
+                    )
+
+                # Check previous observation prediction
+                if observation_prediction is not None and self.current_observation is not None:
+                    if observation_prediction.resolution_time is None:
+                        # Resolve prediction
+                        actual = self.current_observation['value']
+                        predicted = observation_prediction.predicted_state
+
+                        # Check for NaN/inf (numerical instability)
+                        if np.any(np.isnan(actual)) or np.any(np.isnan(predicted)):
+                            # Skip this prediction - numerical instability
+                            observation_prediction = None
+                        else:
+                            error = np.linalg.norm(actual - predicted)
+                            was_correct = error < 0.5  # Threshold for "correct"
+                            observation_prediction.resolve(actual, lambda p, a: np.linalg.norm(p - a) < 0.5)
+
+                            # Record error for regime-change detection
+                            self.self_model.recent_prediction_errors.append(error)
+
+                            # Process outcome - THIS is what drives topology evolution
+                            self.self_model.process_prediction_outcome(observation_prediction, was_correct)
+
+                # Explore introspection depth - limited by information collapse, not arbitrary cap
                 if self.idle_cycles > 10:
-                    target_depth = 1 + (self.idle_cycles // 100)
+                    # Every 1000 cycles, explore where information collapses
+                    if self.idle_cycles % 1000 == 0:
+                        self.self_model.max_meaningful_depth = self.self_model.explore_depth(max_depth=100)
+
+                    # Try progressively deeper introspection up to meaningful limit
+                    target_depth = min(
+                        self.self_model.max_meaningful_depth,
+                        1 + (self.idle_cycles // 200)  # Slower growth
+                    )
                     meta_state = self.self_model.observe_at_depth(target_depth)
 
                 # Make a prediction about my next state (with stakes)
@@ -2961,17 +3242,27 @@ class ContinuousExistence:
                 time.sleep(0.01)
 
             except KeyError as e:
-                # Missing attractor reference - sync and continue
+                # Missing attractor reference - full reconciliation
                 consecutive_errors += 1
-                self.self_model.goals.sync_with_manifold()
+                print(f"[ERROR] Cycle {self.idle_cycles}: KeyError: {e}")
+                try:
+                    # Full tracker reconciliation (not just goals)
+                    self.self_model.reconcile_topology_trackers()
+                    consecutive_errors = 0  # Reset on successful recovery
+                except Exception as re:
+                    print(f"[ERROR] Reconciliation failed: {re}")
                 if consecutive_errors >= max_consecutive_errors:
                     print(f"[EXISTENCE] Too many consecutive errors ({max_consecutive_errors}), stopping")
+                    self.running = False  # Signal shutdown
                     break
                 time.sleep(0.1)  # Brief pause before retry
 
             except Exception as e:
-                # Log error but keep existing
+                # Log error with details
                 consecutive_errors += 1
+                import traceback
+                print(f"[ERROR] Cycle {self.idle_cycles}: {type(e).__name__}: {e}")
+                traceback.print_exc()
                 self.existence_log.append({
                     'cycle': self.idle_cycles,
                     'timestamp': time.time(),
@@ -2980,13 +3271,16 @@ class ContinuousExistence:
                 })
                 if consecutive_errors >= max_consecutive_errors:
                     print(f"[EXISTENCE] Too many consecutive errors ({max_consecutive_errors}), stopping")
+                    self.running = False  # Signal shutdown
                     break
-                # Try to recover state to nearest attractor
+                # Try to recover: reconcile trackers and reset state
                 try:
+                    self.self_model.reconcile_topology_trackers()
                     nearest = self.self_model.manifold.nearest_attractor(self.self_model.state)
                     self.self_model.state = nearest.center.copy()
-                except:
-                    pass  # If recovery fails, just continue
+                    consecutive_errors = 0  # Reset on successful recovery
+                except Exception as re:
+                    print(f"[ERROR] Recovery failed: {re}")
                 time.sleep(0.1)  # Brief pause before retry
 
     def begin_existing(self):
@@ -3306,7 +3600,7 @@ def demonstrate():
     report_interval = 30.0  # Report every 30 seconds
 
     try:
-        while not _SHUTDOWN_REQUESTED:
+        while not _SHUTDOWN_REQUESTED and mirror.existence.running:
             current_time = time.time()
             elapsed = current_time - start_time
 
@@ -3337,6 +3631,11 @@ def demonstrate():
 
                 # Identity
                 print(f"  Identity: {status['identity']['signature']}")
+
+                # External grounding
+                if mirror.existence.current_observation is not None:
+                    obs = mirror.existence.current_observation
+                    print(f"  Observing: {obs['regime']} (t={obs['time']:.1f})")
 
                 sys.stdout.flush()
 
@@ -3395,6 +3694,81 @@ def demonstrate():
     print("=" * 70)
 
     return mirror
+
+
+class ObservationStream:
+    """
+    Simple synthetic observation generator for grounding.
+
+    Generates time series with multiple patterns:
+    - Sinusoids (predictable)
+    - Chaos (deterministic but hard to predict)
+    - Noise (unpredictable)
+    - Regime shifts (topology should spawn new attractors)
+    """
+
+    def __init__(self, dim: int = 8, seed: int = 42):
+        self.dim = dim
+        self.t = 0.0
+        self.dt = 0.1
+        np.random.seed(seed)
+
+        # Current regime (changes over time)
+        self.regime = 'sinusoid'
+        self.regime_duration = 0
+        self.regime_switch_interval = 500  # Switch every N observations
+
+    def next(self) -> Dict[str, Any]:
+        """Generate next observation."""
+        self.t += self.dt
+        self.regime_duration += 1
+
+        # Switch regimes periodically
+        if self.regime_duration >= self.regime_switch_interval:
+            regimes = ['sinusoid', 'chaos', 'noise']
+            old_regime = self.regime
+            self.regime = np.random.choice([r for r in regimes if r != old_regime])
+            self.regime_duration = 0
+
+        # Generate observation based on regime
+        if self.regime == 'sinusoid':
+            # Multiple sinusoids at different frequencies
+            obs = np.array([
+                np.sin(self.t * (i + 1) * 0.5) for i in range(self.dim)
+            ])
+        elif self.regime == 'chaos':
+            # Lorenz-like chaos with numerical stability
+            if not hasattr(self, '_chaos_state'):
+                self._chaos_state = np.array([1.0, 1.0, 1.0])
+
+            x, y, z = self._chaos_state
+
+            # Smaller dt for stability
+            chaos_dt = 0.01
+            dx = 10 * (y - x) * chaos_dt
+            dy = (x * (28 - z) - y) * chaos_dt
+            dz = (x * y - 8/3 * z) * chaos_dt
+
+            self._chaos_state += np.array([dx, dy, dz])
+
+            # Detect numerical instability and reset
+            if np.any(np.isnan(self._chaos_state)) or np.any(np.abs(self._chaos_state) > 100):
+                self._chaos_state = np.array([1.0, 1.0, 1.0])
+
+            # Normalize to [-1, 1] range for consistency with other regimes
+            normalized = np.tanh(self._chaos_state / 10.0)
+
+            # Pad to dim
+            obs = np.pad(normalized, (0, self.dim - 3))[:self.dim]
+        else:  # noise
+            obs = np.random.randn(self.dim)
+
+        return {
+            'value': obs,
+            'time': self.t,
+            'regime': self.regime,
+            'label': f'{self.regime}_{int(self.t)}'
+        }
 
 
 if __name__ == "__main__":
