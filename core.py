@@ -3639,6 +3639,45 @@ def demonstrate():
 
                 sys.stdout.flush()
 
+                # Export status as JSON for web interface
+                try:
+                    status_export = {
+                        'timestamp': current_time,
+                        'elapsed': elapsed,
+                        'cycles': status['existence']['total_cycles'],
+                        'introspectionDepth': status['existence']['max_introspection_depth'],
+                        'emergenceScore': status['existence']['emergence_score'],
+                        'currentAttractor': status['manifold']['current_attractor'],
+                        'energy': status['manifold']['current_energy'],
+                        'distanceToCenter': status['manifold']['distance_to_attractor'],
+                        'attractorCount': status['existence']['attractor_count'],
+                        'avgDepth': status['existence']['avg_attractor_depth'],
+                        'evolutionCount': status['existence']['identity_evolution_count'],
+                        'structuralAge': status['existence']['structural_age'],
+                        'goalFocus': status['existence']['goal_focus'],
+                        'identity': status['identity']['signature'],
+                        'observation': mirror.existence.current_observation,
+                        'attractors': [
+                            {
+                                'id': sig,
+                                'depth': attractor.depth,
+                                'radius': attractor.radius,
+                                'center': attractor.center.tolist()[:2]  # First 2 dims for viz
+                            }
+                            for sig, attractor in mirror.self_model.manifold.attractors.items()
+                        ],
+                        'topologyHistory': mirror.identity.topology_history[-20:],  # Last 20 events
+                        'goalPreferences': status['goals']['preferences'],
+                        'dynamicsVerified': status['dynamics_verified']
+                    }
+
+                    with open('web-interface/.mirrors-status.json', 'w') as f:
+                        json.dump(status_export, f, indent=2)
+                except Exception as e:
+                    # Don't crash if export fails
+                    print(f"  [Warning] Failed to export status JSON: {e}")
+                    pass
+
             # Brief sleep to not spin
             time.sleep(0.5)
 

@@ -1,0 +1,17 @@
+{
+  "timestamp": 1771935785.1897795,
+  "elapsed": 271.10280990600586,
+  "cycles": 8939,
+  "introspectionDepth": 99,
+  "emergenceScore": 2.149518232863626,
+  "currentAttractor": "b6318b90",
+  "energy": -2.4775067204263093,
+  "distanceToCenter": 0.07360755978827434,
+  "attractorCount": 5,
+  "avgDepth": 1.1364942284802397,
+  "evolutionCount": 10,
+  "structuralAge": 17.0,
+  "goalFocus": 0.11938219989894139,
+  "identity": "9b7a406d5192880d",
+  "observation": {
+    "value": 
