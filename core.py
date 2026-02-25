@@ -3641,6 +3641,17 @@ def demonstrate():
 
                 # Export status as JSON for web interface
                 try:
+                    # Serialize observation (convert numpy arrays to lists)
+                    obs_export = None
+                    if mirror.existence.current_observation is not None:
+                        obs = mirror.existence.current_observation
+                        obs_export = {
+                            'regime': obs['regime'],
+                            'time': obs['time'],
+                            'label': obs['label'],
+                            'value': obs['value'].tolist()  # Convert ndarray to list
+                        }
+
                     status_export = {
                         'timestamp': current_time,
                         'elapsed': elapsed,
@@ -3656,7 +3667,7 @@ def demonstrate():
                         'structuralAge': status['existence']['structural_age'],
                         'goalFocus': status['existence']['goal_focus'],
                         'identity': status['identity']['signature'],
-                        'observation': mirror.existence.current_observation,
+                        'observation': obs_export,
                         'attractors': [
                             {
                                 'id': sig,
