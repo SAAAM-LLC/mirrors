@@ -3641,22 +3641,25 @@ def demonstrate():
 
                 # Export status as JSON for web interface
                 try:
-                    # Serialize observation (convert numpy arrays to lists)
-                    obs_export = None
-                    if mirror.existence.current_observation is not None:
-                        obs = mirror.existence.current_observation
-                        obs_export = {
-                            'regime': obs['regime'],
-                            'time': obs['time'],
-                            'label': obs['label'],
-                            'value': obs['value'].tolist()  # Convert ndarray to list
-                        }
-
-                    # Convert dynamics_verified keys from DynamicType enum to strings
-                    dynamics_verified_str = {
-                        k.value if isinstance(k, DynamicType) else str(k): v
-                        for k, v in status['dynamics_verified'].items()
-                    }
+                    def convert_for_json(obj):
+                        """Recursively convert numpy/enum types to JSON-serializable types."""
+                        if isinstance(obj, np.ndarray):
+                            return obj.tolist()
+                        elif isinstance(obj, (np.integer, np.floating)):
+                            return obj.item()
+                        elif isinstance(obj, np.bool_):
+                            return bool(obj)
+                        elif isinstance(obj, DynamicType):
+                            return obj.value
+                        elif isinstance(obj, dict):
+                            return {
+                                (k.value if isinstance(k, DynamicType) else str(k)): convert_for_json(v)
+                                for k, v in obj.items()
+                            }
+                        elif isinstance(obj, (list, tuple)):
+                            return [convert_for_json(item) for item in obj]
+                        else:
+                            return obj
 
                     status_export = {
                         'timestamp': current_time,
@@ -3673,23 +3676,26 @@ def demonstrate():
                         'structuralAge': status['existence']['structural_age'],
                         'goalFocus': status['existence']['goal_focus'],
                         'identity': status['identity']['signature'],
-                        'observation': obs_export,
+                        'observation': mirror.existence.current_observation,
                         'attractors': [
                             {
                                 'id': sig,
                                 'depth': attractor.depth,
                                 'radius': attractor.radius,
-                                'center': attractor.center.tolist()[:2]  # First 2 dims for viz
+                                'center': attractor.center[:2].tolist()  # First 2 dims for viz
                             }
                             for sig, attractor in mirror.self_model.manifold.attractors.items()
                         ],
                         'topologyHistory': mirror.identity.topology_history[-20:],  # Last 20 events
                         'goalPreferences': status['goals']['preferences'],
-                        'dynamicsVerified': dynamics_verified_str
+                        'dynamicsVerified': status['dynamics_verified']
                     }
 
+                    # Convert everything recursively
+                    status_export_clean = convert_for_json(status_export)
+
                     with open('web-interface/.mirrors-status.json', 'w') as f:
-                        json.dump(status_export, f, indent=2)
+                        json.dump(status_export_clean, f, indent=2)
                 except Exception as e:
                     # Don't crash if export fails
                     print(f"  [Warning] Failed to export status JSON: {e}")
