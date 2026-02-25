@@ -3652,6 +3652,12 @@ def demonstrate():
                             'value': obs['value'].tolist()  # Convert ndarray to list
                         }
 
+                    # Convert dynamics_verified keys from DynamicType enum to strings
+                    dynamics_verified_str = {
+                        k.value if isinstance(k, DynamicType) else str(k): v
+                        for k, v in status['dynamics_verified'].items()
+                    }
+
                     status_export = {
                         'timestamp': current_time,
                         'elapsed': elapsed,
@@ -3679,7 +3685,7 @@ def demonstrate():
                         ],
                         'topologyHistory': mirror.identity.topology_history[-20:],  # Last 20 events
                         'goalPreferences': status['goals']['preferences'],
-                        'dynamicsVerified': status['dynamics_verified']
+                        'dynamicsVerified': dynamics_verified_str
                     }
 
                     with open('web-interface/.mirrors-status.json', 'w') as f:
