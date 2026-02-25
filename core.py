@@ -2969,16 +2969,20 @@ class EmergenceMonitor:
         decay_halflife = 60.0
         decay_rate = np.log(2) / decay_halflife
 
+        # CRITICAL: Make a snapshot copy to avoid "deque mutated during iteration"
+        # The existence loop thread may be adding events while we iterate
+        events_snapshot = list(self.events)
+
         score = 0.0
-        for event in self.events:
+        for event in events_snapshot:
             age = now - event.timestamp
             decay = np.exp(-decay_rate * age)
             weight = weights.get(event.signal_type, 1.0)
             score += event.magnitude * weight * decay
 
         # Normalize by window duration (capped at 5 minutes)
-        if len(self.events) >= 2:
-            window_duration = min(300.0, now - self.events[0].timestamp)
+        if len(events_snapshot) >= 2:
+            window_duration = min(300.0, now - events_snapshot[0].timestamp)
             if window_duration > 0:
                 score /= window_duration
 
@@ -3643,23 +3647,36 @@ def demonstrate():
                 try:
                     def convert_for_json(obj):
                         """Recursively convert numpy/enum types to JSON-serializable types."""
-                        if isinstance(obj, np.ndarray):
+                        # Handle None explicitly
+                        if obj is None:
+                            return None
+                        # NumPy arrays
+                        elif isinstance(obj, np.ndarray):
                             return obj.tolist()
+                        # NumPy scalar types
                         elif isinstance(obj, (np.integer, np.floating)):
                             return obj.item()
                         elif isinstance(obj, np.bool_):
                             return bool(obj)
+                        # Enum types
                         elif isinstance(obj, DynamicType):
                             return obj.value
+                        elif isinstance(obj, Enum):  # Catch any other enums
+                            return obj.value
+                        # Collections
                         elif isinstance(obj, dict):
                             return {
-                                (k.value if isinstance(k, DynamicType) else str(k)): convert_for_json(v)
+                                (k.value if isinstance(k, (DynamicType, Enum)) else str(k) if not isinstance(k, (str, int, float)) else k): convert_for_json(v)
                                 for k, v in obj.items()
                             }
                         elif isinstance(obj, (list, tuple)):
                             return [convert_for_json(item) for item in obj]
-                        else:
+                        # JSON-safe primitives
+                        elif isinstance(obj, (str, int, float, bool)):
                             return obj
+                        # Last resort: convert to string
+                        else:
+                            return str(obj)
 
                     status_export = {
                         'timestamp': current_time,
@@ -3697,8 +3714,12 @@ def demonstrate():
                     with open('web-interface/.mirrors-status.json', 'w') as f:
                         json.dump(status_export_clean, f, indent=2)
                 except Exception as e:
-                    # Don't crash if export fails
+                    # Don't crash if export fails - but show detailed error for debugging
+                    import traceback
                     print(f"  [Warning] Failed to export status JSON: {e}")
+                    if False:  # Set to True for debugging
+                        print("  Full traceback:")
+                        traceback.print_exc()
                     pass
 
             # Brief sleep to not spin
