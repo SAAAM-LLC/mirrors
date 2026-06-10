@@ -6,18 +6,13 @@ How the MIRRORS framework connects to SAM's tokenizer-free neuroplastic architec
 
 This is the bridge between philosophical insight and practical implementation.
 
-"We don't follow the pack, we lead the damn industry."
+"We don't follow the pack"
 - SAAAM LLC
 
 """
 
 from typing import Dict, Any, Optional
 import numpy as np
-
-
-# =============================================================================
-# THE CONNECTION: WHY SAM WAS ALREADY ON THE RIGHT PATH
-# =============================================================================
 
 """
 SAM's core innovations, mapped to MIRRORS dynamics:

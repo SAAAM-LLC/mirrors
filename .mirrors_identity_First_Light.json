@@ -1,0 +1,164 @@
+{
+  "signature": "9994d7a4333f5248",
+  "creation_timestamp": 1772542970.2172256,
+  "manifold_hash": "3fef83bb5a3ce0e6",
+  "causal_history_hash": "eba37dbb19e965c6",
+  "attractor_affinities": {
+    "f544c4ea": 0.0,
+    "8b4ff727": 0.0,
+    "f2738dbb": 0.0,
+    "b3d3fce7": 53851.94535088539,
+    "2215a906": 0.0
+  },
+  "goal_structure_hash": "f89c0fb32a445def",
+  "topology_history": [
+    {
+      "type": "merge",
+      "timestamp": 1772543082.2049124,
+      "details": {
+        "merged": [
+          "32b7cad8",
+          "851b8d12"
+        ],
+        "result": "ae591780"
+      },
+      "evolution_count": 0
+    },
+    {
+      "type": "merge",
+      "timestamp": 1772543083.1861331,
+      "details": {
+        "merged": [
+          "724c85f1",
+          "ae591780"
+        ],
+        "result": "6e0b8f11"
+      },
+      "evolution_count": 1
+    },
+    {
+      "type": "merge",
+      "timestamp": 1772543084.1327288,
+      "details": {
+        "merged": [
+          "171259c6",
+          "6e0b8f11"
+        ],
+        "result": "0c880cf6"
+      },
+      "evolution_count": 2
+    },
+    {
+      "type": "spawn",
+      "timestamp": 1772543085.1069617,
+      "details": {
+        "new_attractor": "f544c4ea",
+        "location_hash": "f544c4ea"
+      },
+      "evolution_count": 3
+    },
+    {
+      "type": "merge",
+      "timestamp": 1772543085.1069617,
+      "details": {
+        "merged": [
+          "9f2f0060",
+          "0c880cf6"
+        ],
+        "result": "a069998e"
+      },
+      "evolution_count": 4
+    },
+    {
+      "type": "spawn",
+      "timestamp": 1772543086.078474,
+      "details": {
+        "new_attractor": "8b4ff727",
+        "location_hash": "8b4ff727"
+      },
+      "evolution_count": 5
+    },
+    {
+      "type": "merge",
+      "timestamp": 1772543086.079482,
+      "details": {
+        "merged": [
+          "c8c813c9",
+          "a069998e"
+        ],
+        "result": "77374b2d"
+      },
+      "evolution_count": 6
+    },
+    {
+      "type": "spawn",
+      "timestamp": 1772543087.0459788,
+      "details": {
+        "new_attractor": "f2738dbb",
+        "location_hash": "f2738dbb"
+      },
+      "evolution_count": 7
+    },
+    {
+      "type": "merge",
+      "timestamp": 1772543087.0459788,
+      "details": {
+        "merged": [
+          "51d4273d",
+          "77374b2d"
+        ],
+        "result": "b3d3fce7"
+      },
+      "evolution_count": 8
+    },
+    {
+      "type": "spawn",
+      "timestamp": 1772543088.0158849,
+      "details": {
+        "new_attractor": "2215a906",
+        "location_hash": "2215a906"
+      },
+      "evolution_count": 9
+    }
+  ],
+  "evolution_count": 10,
+  "spawned_attractors": [
+    "f544c4ea",
+    "8b4ff727",
+    "f2738dbb",
+    "2215a906"
+  ],
+  "merged_attractors": [
+    [
+      "32b7cad8",
+      "851b8d12",
+      "ae591780"
+    ],
+    [
+      "724c85f1",
+      "ae591780",
+      "6e0b8f11"
+    ],
+    [
+      "171259c6",
+      "6e0b8f11",
+      "0c880cf6"
+    ],
+    [
+      "9f2f0060",
+      "0c880cf6",
+      "a069998e"
+    ],
+    [
+      "c8c813c9",
+      "a069998e",
+      "77374b2d"
+    ],
+    [
+      "51d4273d",
+      "77374b2d",
+      "b3d3fce7"
+    ]
+  ],
+  "pruned_attractors": []
+}
